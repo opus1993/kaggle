@@ -1,0 +1,480 @@
+---
+title: "Cement Strength Playground Series Season3 Episode9"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+# Introduction  
+
+<div 
+    style="background-image: url('https://plus.unsplash.com/premium_photo-1661881903643-574667aa88a7?ixlib=rb-4.0.3&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=2306&q=80'); 
+    width:100%; 
+    height:600px; 
+    background-position:center;">&nbsp;
+</div>
+
+*Photo by Unsplash.*
+
+The dataset for this competition (both train and test) was derived from a deep learning model trained on the concrete strength dataset. 
+
+My notebook serves as a clean demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+# Preparation {.tabset .tabset-fade .tabset-pills}
+
+## Load Libraries
+
+We load a range of libraries for general data wrangling and general visualisation together with more specialised tools.
+
+```{r }
+#| label: setup
+
+suppressPackageStartupMessages({
+library(tidyverse) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+
+library(ggforce)
+library(corrr) # a handy pairwise correlations tool
+library(GGally) # plotting extensions for ggplot2 for EDA
+
+library(h2o)
+library(agua)
+
+})
+    
+tidymodels_prefer()
+
+theme_set(ggplot2::theme_light())
+
+metrics <- metric_set(rmse)
+
+```
+## Load data
+
+Were setting a path structure that will allow us to run this notebook locally and on Kaggle without having to manually change the file paths from one platform to the other:
+
+```{r}
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s3e9/"
+} else {
+  path <- str_c(here::here("data"),"/")
+}
+```
+
+
+
+```{r }
+#| label: load data
+
+raw_df <- read_csv(str_c(path,"train.csv"),
+                   show_col_types = FALSE,
+                   col_types = "cddddddddd") |> 
+          janitor::clean_names()
+
+competition_df <- read_csv(str_c(path,"test.csv"),
+                   show_col_types = FALSE,
+                   col_types = "cdddddddd") |> 
+          janitor::clean_names()
+
+dim(raw_df)
+dim(competition_df)
+
+```
+
+## Overview: Structure and Data Content
+
+The first thing you want to do is to look at your actual data in its raw form. This will tell us about the types of features we are dealing with (numeric, categorical, string, etc.), as well as already reveal some characteristics of the dataset. This includes checking for missing values.
+
+Description of Fields are as follows:-
+
+CementComponent:- Amount of cement is mixed
+BlastFurnaceSlag:- Amount of Blast Furnace Slag is mixed
+FlyAshComponent:- Amount of FlyAsh is mixed
+WaterComponent:- Amount of water is mixed
+SuperplasticizerComponent:- Amount of Super plasticizer is mixed
+CoarseAggregateComponent:- Amount of Coarse Aggregate is mixed
+FineAggregateComponent:- Amount of Coarse Aggregate is mixed
+AgeInDays:- How many days it was left dry
+Strength:- What was the final strength of concrete- (Target)
+
+Generally, we dont want to look at the test data any more than strictly necessary. The test dataset is intended to serve as our final model validation, and should only include data that the model has never seen before. Since our brain is part of the modelling process as well (or at least it should be), we want to avoid picking up any signal in the test data that could consciously or unconsciously influence our decisions. Thus, this EDA will almost entirely focus on the `train.csv` data.
+
+I walk through a process using *skimr* of exploring each variable at the console. Some are obviously multi-level categories. Others imply calendar dates.
+
+```{r}
+#| label: skimr
+skimr::skim(raw_df)
+```
+
+```{r}
+#| label: skimr competition
+skimr::skim(competition_df)
+```
+
+I'm noting that the concrete composition is in groups where batches of product must have been manufactured and subsequently measured at different age_in_days.
+
+This pre-processor function is meant to apply equally on the training data and the unlabeled competition dataset.
+
+
+```{r}
+#| label: concrete compositions
+
+cement_recipe <- c("cement_component", "blast_furnace_slag", "fly_ash_component", 
+                   "water_component",  "superplasticizer_component", "coarse_aggregate_component",
+                   "fine_aggregate_component")
+
+all_df <- bind_rows(
+  raw_df %>% mutate(source = "train"),
+  competition_df %>% mutate(source = "competition")
+)  %>%  mutate(source = factor(source))
+
+concrete_composition_groups <- all_df |> 
+  count(pick(all_of(cement_recipe)), sort = TRUE) |> 
+  mutate(cement_recipe_id = as.character(row_number()))
+
+raw_df <- raw_df |> 
+  inner_join(concrete_composition_groups) |> 
+  select(-n)
+
+competition_df <- competition_df |> 
+  inner_join(concrete_composition_groups) |> 
+  select(-n)
+
+all_df <- all_df |> 
+  inner_join(concrete_composition_groups) |> 
+  select(-n) 
+
+dim(raw_df)
+dim(competition_df)
+```
+
+## Duplicated Values
+
+Are there observations in competition that are already in the training data with a correct label?
+
+```{r}
+
+all_df |> 
+  janitor::get_dupes(cement_recipe_id, age_in_days) |> 
+  count(source)
+
+raw_df |> 
+  filter(cement_recipe_id %in% c(4, 6, 9)) |> 
+  ggplot(aes(age_in_days, strength, color = cement_recipe_id, group = cement_recipe_id)) +
+  geom_point(show.legend = FALSE) +
+  geom_smooth(show.legend = FALSE, se = FALSE) +
+  labs(title = "Strength over time for three different concrete compositions",
+       subtitle = "Even at the same age, there is variance in strength measurements")
+
+```
+
+There is quite a bit of scatter in strength values, even for the same concrete composition and aging in days.
+
+## Train and test compositions
+
+What compositions exist only in train? in test? in both?
+
+```{r}
+#| label: compositions in train and test
+
+all_df |> 
+ select(cement_recipe_id, source) |> 
+ distinct() |> 
+ count(cement_recipe_id, source) |> 
+ pivot_wider(
+   names_from = source,
+   values_from = n
+ ) |> 
+  mutate(both = if_else(competition == 1 & train == 1, 1, 0)) |> 
+  summarize(
+    competition_recipes = sum(competition, na.rm = TRUE),
+    train_recipes = sum(train, na.rm = TRUE),
+    recipes_in_both = sum(both, na.rm = TRUE)
+  )
+
+```
+
+## Missing Values
+
+Lets have a closer look at any missing values. How many are there in total in the train and competition datasets?
+
+
+```{r}
+glue::glue("The train set has { sum(is.na(raw_df)) } missing values, and the test set has { sum(is.na(competition_df)) }.")
+```
+
+I'll come back to investigate whether 0 values, or some other coding, is actually missing.
+
+Also, the existence of an age_in_days feature suggests that a survival mechanism might be part of this model.
+
+# Predictor Features {.tabset .tabset-fade .tabset-pills}
+
+## Numeric 
+
+```{r}
+#| label: numeric features
+#| fig.height: 12
+#| fig.width: 13
+all_df  %>% 
+  select(where(base::is.numeric), id, source)  %>%  
+  pivot_longer(- c(id, source),
+    names_to = "metric",
+    values_to = "value"
+  )  %>% 
+  ggplot(aes(value, fill = source)) +
+  geom_histogram(aes(y =  after_stat(density)),alpha = 0.6, bins = 50) +
+  geom_density(alpha = 0.1, position = "dodge") +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+labs(title = "Numeric Feature Value density plots in combined train and test")
+
+```
+
+## Q-Q
+
+```{r}
+#| label: qq plots
+#| fig.height: 12
+#| fig.width: 13
+
+all_df %>% 
+  select(where(base::is.numeric), source)  %>%  
+  pivot_longer(- c(source),
+    names_to = "metric",
+    values_to = "value"
+  )  %>% 
+  ggplot(aes(sample = value, color = source)) + 
+  stat_qq(show.legend = FALSE) + 
+  stat_qq_line(show.legend = FALSE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(title = "Log transformed QQ plots versus a normal distribution")
+
+
+
+```
+
+
+## Target: Strength
+
+On to the target itself. We figured out that `strength` is a continuous feature, and always positive.  
+
+```{r }
+#| label: booking status target
+raw_df %>% 
+  ggplot(aes(strength)) +
+  geom_density(alpha = 0.3) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(y = "Count of Samples", x = "Strength", title = "Target: Concrete Strength")
+```
+
+# Feature-target interactions {.tabset .tabset-fade .tabset-pills}
+
+## ggpairs
+
+We can employ the `ggpairs` function to get a quick overview of potentially interesting feature interactions and their target impact:
+
+```{r}
+#| label: interesting feature interactions
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+foo <- raw_df %>% 
+  select(where(base::is.numeric), strength) %>% 
+  drop_na() 
+
+foo %>% 
+  ggpairs(
+    columns = 1:(ncol(foo)-1),
+    mapping = aes(color = ggplot2::cut_number(strength, 5), alpha = 0.5),
+    lower = list(continuous = wrap("points", alpha = 0.3, size=0.01)),
+    upper = list(continuous = wrap("smooth", alpha = 0.005, size = 0.1)),
+    progress = FALSE) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Pair plots: lower: scatter; upper: linear fit - color by target")
+
+```
+
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## Parallel
+
+Too speed computation, we will load up a parallel backend.
+
+```{r}
+#| label: assign a parallel backend
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+available_cores <- parallelly::availableCores(omit = 1)
+available_cores
+
+future::plan("multisession", workers = available_cores) 
+
+# h2o_start()
+h2o.init(nthreads = available_cores)
+```
+
+## Parsnip engines
+
+The models themselves are handled by the `parsnip` package. It includes pretty much all the popular models, including the random forests and tree boosters. 
+
+The parameters are pretty straightforward. For example, we're using a lasso regression model, indicated by `mixture = 1`. (A `mixture = 0` would be a pure ridge model, i.e. L1 regularisation, and anything between 0 and 1 is possible.) 
+
+We define a handful of other classification engines, including xgboost and lightgbm as well.
+
+```{r}
+#| label: model specifications
+
+auto_spec <-
+  auto_ml() %>%
+  set_engine("h2o", 
+             sort_metric = "RMSE",
+             stopping_metric = "RMSE",
+             keep_cross_validation_predictions = TRUE,
+             max_runtime_secs = 5400*4, 
+             validation = 0.1,
+             seed = 42) %>%
+  set_mode("regression")
+
+```
+
+## Preprocessing recipes
+
+This is easily the step we're putting the most thought into, since we want to apply some of the things we've learnt during the EDA. The data preprocessing package within `tidymodels` is called `recipes`.
+
+We're taking the `id` column along, but we don't want it to be affected by any of the processing. This is achieved using "roles".
+
+Any imputing of missing values would be done here, if needed. There are multiple imputation functions available within `recipes`. For inspiration on how to treat missing values check out [Rob's Notebook](https://www.kaggle.com/robikscube/handling-with-missing-data-youtube-stream). 
+
+We then apply a one-hot encoding to the categorical features. That's not really necessary for many of the tree model types. We will also normalise all numerical features.
+
+We will apply polynomial expansions, non linear basis splines, and interactions as indicated in the EDA above.
+
+And finally, we eliminate features with low variance and normalize everything.
+
+I like to make a check one more time of the transformed feature correlations. Here, the week feature and the quarter feature are correlated, which makes sense. A regularization penalty will drop one or both of them.
+
+Be cognizant of correlated features in the variable importance scores as well.
+
+```{r}
+#| label: set the recipe
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+rec <- recipe(strength ~ ., data = raw_df )  %>% 
+  update_role(id, cement_recipe_id,  new_role = "id")  |> 
+  
+  step_log(age_in_days) |> 
+
+  step_mutate(aggregate = coarse_aggregate_component + fine_aggregate_component,
+              total_mass = water_component + cement_component + blast_furnace_slag +
+                fly_ash_component + superplasticizer_component + coarse_aggregate_component +
+                fine_aggregate_component) |> 
+
+  step_ratio(water_component, aggregate,
+             fly_ash_component, blast_furnace_slag, 
+             superplasticizer_component, 
+             denom = denom_vars(cement_component)) |> 
+  step_ratio(coarse_aggregate_component,
+             denom = denom_vars(fine_aggregate_component)) |> 
+  step_ratio(water_component,  cement_component, blast_furnace_slag,
+             fly_ash_component, superplasticizer_component, coarse_aggregate_component,
+             fine_aggregate_component, denom = denom_vars(total_mass)) |> 
+
+  step_interact(~ age_in_days:water_component_o_total_mass) |>             
+  step_interact(~ age_in_days:cement_component_o_total_mass)  |>  
+  step_interact(~ superplasticizer_component:fly_ash_component) |> 
+  
+  step_ns(age_in_days) |> 
+  
+  step_rm(water_component,  cement_component, blast_furnace_slag,
+             fly_ash_component, superplasticizer_component, coarse_aggregate_component,
+             fine_aggregate_component, total_mass, aggregate) |> 
+  
+  step_normalize(all_numeric_predictors()) |> 
+  step_nzv(all_numeric_predictors()) |> 
+  step_corr(all_numeric_predictors(), threshold = 0.98)
+
+rec |> prep() |> bake(new_data = NULL) |> 
+  corrr::correlate(quiet = TRUE) |> 
+  rearrange() %>% 
+  shave() %>% 
+  rplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0, hjust=1))
+
+```
+
+
+## H2O
+
+```{r}
+#| label: h2o auto 
+
+auto_fit <- fit(workflow(rec, auto_spec), data = raw_df)
+
+agua::rank_results(auto_fit) %>%
+  filter(.metric == "rmse") %>%
+  arrange(rank)
+
+autoplot(auto_fit, type = "rank", metric = "rmse") +
+  theme(legend.position = "none")
+
+predict(auto_fit, raw_df) |> 
+  bind_cols(raw_df) |> 
+  rmse(strength, .pred)
+
+
+predict(auto_fit, raw_df) |>
+  ggplot(aes(.pred)) +
+  geom_histogram()
+
+predict(auto_fit, raw_df) |>
+  bind_cols(raw_df) |>
+  mutate(total_mass = water_component + cement_component + blast_furnace_slag +
+                fly_ash_component + superplasticizer_component + coarse_aggregate_component +
+                fine_aggregate_component) |> 
+  mutate(cement_range =  ggplot2::cut_interval(cement_component/total_mass, 5)) |> 
+  ggplot(aes(strength, .pred - strength, color = cement_range)) +
+  geom_point() +
+  geom_rug() +
+  labs(title = "Residuals",
+       subtitle = "There grouped bands of concrete recipes may deliver more predictive power")
+
+submission <- predict(auto_fit, competition_df) |>
+  bind_cols(competition_df) |>
+  mutate(strength = .pred, id = as.integer(id)) |> 
+  select(id,strength)
+
+
+```
+And the moment of truth:
+
+```{r}
+#| label: submission
+
+submission %>%
+  ggplot(aes(strength)) +
+  geom_histogram(bins = 40)
+
+submission %>%
+  write_csv(here::here("data", "submission.csv"))
+```

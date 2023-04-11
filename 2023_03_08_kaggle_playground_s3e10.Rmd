@@ -1,0 +1,480 @@
+---
+title: "Pulsar Classification Season3 Episode10"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+# Introduction  
+
+<div 
+    style="background-image: url('https://images.unsplash.com/photo-1520034475321-cbe63696469a?ixlib=rb-4.0.3&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=1470&q=80'); 
+    width:100%; 
+    height:600px; 
+    background-position:center;">&nbsp;
+</div>
+
+*Photo by Unsplash.*
+
+The dataset for this competition (both train and test) was derived from a deep learning model trained on the pulsar dataset. 
+
+My notebook serves as a clean demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+# Preparation {.tabset .tabset-fade .tabset-pills}
+
+## Load libraries
+
+```{r }
+#| label: setup
+
+suppressPackageStartupMessages({
+library(tidyverse) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+
+library(bonsai)
+  
+library(agua)
+library(ggforce)
+
+library(corrr)
+library(GGally)
+
+})
+    
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_set(theme_bw())
+
+metrics <- metric_set(mn_log_loss)
+
+```
+
+## Interchangeability
+
+```{r}
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s3e10/"
+} else {
+  path <- str_c(here::here("data"),"/")
+}
+```
+
+## Load Data
+
+```{r }
+#| label: load data
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) |> 
+          distinct(across(-id), .keep_all = TRUE) |> 
+          mutate(Class = factor(Class,
+                                labels = c("no","pulsar")))
+
+competition_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE)
+
+all_df <- bind_rows(
+  raw_df |> mutate(source = "train"),
+  competition_df |> mutate(source = "competition")
+) |> mutate(source = factor(source))
+
+```
+
+```{r}
+#| label: skimr
+skimr::skim(raw_df)
+```
+
+```{r}
+#| label: skimr competition
+skimr::skim(competition_df)
+```
+
+COLUMNS:
+Based on Integrated Profile of Observation
+
+Mean_Integrated: Mean of Observations
+
+SD: Standard deviation of Observations
+
+EK: Excess kurtosis of Observations
+
+Skewness:  Skewness of Observations.
+
+Mean _ DMSNR _ Curve: Mean of DM SNR CURVE of Observations
+
+SD _ DMSNR _ Curve: Standard deviation of DM SNR CURVE of Observations
+
+EK _ DMSNR _ Curve: Excess kurtosis of DM SNR CURVE of Observations
+
+Skewness _ DMSNR _ Curve: Skewness of DM SNR CURVE of Observations
+
+Class: Class 0 - 1
+
+## Duplicated Values
+
+Is this competition transaction already in the training data with a correct label?
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+all_df |> 
+  group_by(-id) |>  
+  mutate(num_dups = n(), 
+         dup_id = row_number()) |>  
+  ungroup() |> 
+  group_by(source, Class) |> 
+  mutate(is_duplicated = dup_id > 1) |> 
+  count(is_duplicated)
+
+```
+
+This dataset appears to lack any duplicates, after applying the pre-processor.
+
+## Numerics
+
+Lets zoom in more closely on the training set only.
+
+
+```{r}
+#| label: numeric density plots
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+raw_df |> 
+  select(where(is.numeric), Class) |> 
+  pivot_longer(- c(id, Class),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  filter(value > 0.1) |> 
+  ggplot(aes(value, fill = Class, color = NULL)) +
+  geom_density(alpha = 0.6, show.legend = FALSE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+## Q-Q
+
+
+```{r}
+#| label: qq plots
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+all_df |> 
+  select(where(is.numeric), Class) |> 
+  pivot_longer(- c(id, Class),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(sample = value)) + 
+  stat_qq(aes(color = Class)) + 
+  stat_qq_line(show.legend = FALSE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = c(0.8, 0.15))
+```
+
+## Target: Class
+
+On to the target itself. There is a pretty big imbalance in this dataset.
+
+```{r }
+#| label: booking status target
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+raw_df %>% 
+  ggplot(aes(Class, fill = Class)) +
+  geom_bar() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(y = "Count of Samples", x = "Strength", title = "Target: Class")
+```
+
+# Feature-target interactions {.tabset .tabset-fade .tabset-pills}
+
+## ggpairs
+
+```{r}
+#| label: interesting feature interactions
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+foo <- raw_df %>% 
+  select(where(is.numeric), -id, Class) %>% 
+  drop_na() 
+
+foo %>% 
+  ggpairs(
+    columns = 1:(ncol(foo)-1),
+    mapping = aes(color = Class, alpha = 0.5),
+    lower = list(continuous = wrap("points", alpha = 0.3, size=0.01)),
+    upper = list(continuous = wrap("smooth", alpha = 0.005, size = 0.1)),
+    progress = FALSE) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Pair plots: lower: scatter; upper: linear fit - color by target")
+```
+
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## CV
+
+```{r}
+#| label: make resample folds
+
+set.seed(42)
+
+folds <- vfold_cv(raw_df, 
+                  v = 5,
+                  repeats = 2,
+                  strata = Class)
+
+```
+
+## Parallel
+
+Too speed computation, we will load up a parallel backend.
+
+```{r}
+#| label: assign a parallel backend
+
+all_cores <- parallelly::availableCores(omit = 1)
+all_cores
+
+# future::plan("multisession", workers = all_cores) 
+
+doFuture::registerDoFuture()
+cl <- parallel::makeCluster(all_cores)
+future::plan(future::cluster, workers = cl)
+
+```
+
+## Parsnip engines
+
+```{r}
+#| label: model specifications
+
+boost_tree_lgbm_spec <-
+  boost_tree(
+    trees = 200L,
+    min_n = tune(),  #26
+    mtry = tune(),     #27
+    tree_depth = tune(),   # 2
+    learn_rate = 0.1
+  ) %>%
+  set_engine('lightgbm',
+             eval_metric = "binary_logloss",
+             objective = "binary") %>%
+  set_mode('classification')
+
+```
+
+## Preprocessing Recipe
+
+
+```{r}
+#| label: set the recipe
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+(rec <- recipe(Class ~ ., data = raw_df )  %>% 
+  step_rm(id) %>%
+  step_range(Skewness, Skewness_DMSNR_Curve) %>%
+  step_log(Skewness, Mean_DMSNR_Curve, SD_DMSNR_Curve, Skewness_DMSNR_Curve, offset = 0.001) %>%
+  step_sqrt(Mean_Integrated) %>%
+
+  step_interact(~ EK_DMSNR_Curve:Skewness_DMSNR_Curve) |> 
+  step_interact(~ EK:Skewness_DMSNR_Curve) |>   #0.03136 
+  step_interact(~ EK:EK_DMSNR_Curve) |>    #0.03139
+   
+  step_interact(~ Mean_Integrated:SD) |> 
+   
+   step_ratio(EK_DMSNR_Curve,SD,
+              denom = denom_vars(Skewness)) |>
+   step_ratio(Mean_DMSNR_Curve ,Skewness_DMSNR_Curve,
+              denom = denom_vars(EK)) |>
+   step_ratio(Mean_Integrated,Skewness_DMSNR_Curve, Skewness,EK,
+              denom = denom_vars(SD)) |>
+   step_ratio(SD_DMSNR_Curve,
+              denom = denom_vars(Mean_DMSNR_Curve)) |>
+   step_ratio(SD_DMSNR_Curve,Mean_DMSNR_Curve,
+              denom = denom_vars(Skewness_DMSNR_Curve)) |>
+   step_ratio(SD,
+              denom = denom_vars(SD_DMSNR_Curve)) |>
+   step_ratio(Skewness_DMSNR_Curve,
+              denom = denom_vars(EK_DMSNR_Curve)) |>
+   
+
+#  step_interact(~ Mean_DMSNR_Curve:SD_DMSNR_Curve) |> 
+  # step_interact(~ SD:EK_DMSNR_Curve) |> 
+  #  step_interact(~ SD:EK)  |>
+  #  step_interact(~ SD:Mean_DMSNR_Curve) |>
+  #  step_interact(~ SD:Skewness_DMSNR_Curve) |>
+  #  step_interact(~ Skewness:Mean_DMSNR_Curve) |>
+  #  step_interact(~ Skewness:SD_DMSNR_Curve) |>
+  #  step_interact(~ Skewness:Skewness_DMSNR_Curve) |>
+   
+ step_poly(all_predictors(), degree = tune()) %>%
+  step_ns(starts_with("EK_poly"), deg_free = 3) 
+)
+
+```
+
+## UMAP View
+
+```{r}
+#| label:  UMAP view
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+# umap_rec <- rec
+# umap_rec$steps[[15]] <- update(umap_rec$steps[[15]], degree = 2)
+# umap_rec <- umap_rec %>%
+#   embed::step_umap(all_predictors(), 
+#                    epochs = 100,
+#                    neighbors = 50,
+#                    seed = c(1,42),
+#                    keep_original_cols = FALSE,
+#                    outcome = vars(Class), 
+#                    num_comp = 3) 
+# 
+# plot_validation_results <- function(recipe, dat = raw_df, target = Class) {
+#   recipe %>%
+#     # Estimate any additional steps
+#     prep() %>%
+#     # Process the data (the validation set by default)
+#     bake(new_data = dat) %>%
+#     # Create the scatterplot matrix
+#     ggplot(aes(x = .panel_x, y = .panel_y, color = {{target}}, fill = {{target}})) +
+#     geom_point(alpha = 0.4, size = 0.5) +
+#     geom_autodensity(alpha = .3) +
+#     facet_matrix(vars(-{{target}}), layer.diag = 2) + 
+#     scale_color_brewer(palette = "Dark2") + 
+#     scale_fill_brewer(palette = "Dark2")
+# }
+# 
+# 
+# umap_rec %>% 
+#   plot_validation_results() +
+#   ggtitle("UMAP (supervised)")
+
+
+```
+
+## LightGBM
+
+```{r}
+#| label: xgboost
+#| warning: false
+#| fig.height: 10
+#| fig.width: 12
+
+ctrlg <- finetune::control_sim_anneal(
+     verbose = FALSE,
+     verbose_iter = TRUE,
+     save_pred = FALSE,
+     event_level = "second",
+     save_workflow = FALSE,
+     parallel_over = "resamples")
+
+wf <- workflow(rec, boost_tree_lgbm_spec)
+
+lgbm_param <- wf %>%
+  extract_parameter_set_dials() %>%
+  recipes::update(
+    min_n = min_n(range = c(44L,57L)),
+    mtry = mtry(range = c(20L, 26L)),
+    tree_depth = tree_depth(range = c(18L, 23L)),
+    degree = degree(range = c(1.7,3.2))
+  ) %>%
+  finalize(rec  %>% prep() %>% bake(new_data = NULL))
+
+lgbm_burnin <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = 12,
+  control = ctrlg,
+  metrics = metrics,
+  param_info = lgbm_param
+  )
+
+autoplot(lgbm_burnin)
+```
+
+
+```{r}
+
+results <- finetune::tune_sim_anneal(
+  wf,
+  resamples = folds,
+  iter = 200,
+  initial = lgbm_burnin,
+  control = ctrlg,
+  metrics = metrics,
+  param_info = lgbm_param
+  )
+
+autoplot(results) 
+
+collect_metrics(results, metric = "mn_log_loss") %>% 
+  select(-.metric, -.estimator) %>%
+  arrange(mean)
+
+best_fit <- wf %>%
+     finalize_workflow(select_best(results)) %>% 
+     fit(raw_df) 
+
+```
+
+
+# Submission
+
+
+```{r}
+
+submission_df <- predict(best_fit, competition_df, type = "prob") |>
+  bind_cols(competition_df) |>
+  mutate(Class = .pred_pulsar, id = as.integer(id)) |> 
+  select(id,Class)
+
+submission_df |> 
+  ggplot(aes(Class)) +
+  geom_histogram()
+
+submission_df %>%
+  write_csv(str_c(path, "submission.csv"))
+```
+
+
+
+

@@ -1,0 +1,780 @@
+---
+title: "Kidney Stone Classification Season3 Episode12"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+# Introduction  
+
+<div 
+    style="background-image: url('http://www.loyolamedicine.org/assets/images/blog-thumbnails/blog-kidneystones.jpg'); 
+    width:100%; 
+    height:600px; 
+    background-position:center;">&nbsp;
+</div>
+
+*Photo by Loyola Medicine.*
+
+The dataset for this competition (both train and test) was generated from a deep learning model trained on the [Kidney Stone Prediction based on Urine Analysis](https://www.kaggle.com/datasets/vuppalaadithyasairam/kidney-stone-prediction-based-on-urine-analysis) dataset.
+
+My notebook serves as a clean demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+# Preparation {.tabset .tabset-fade .tabset-pills}
+
+## Load libraries
+
+```{r }
+#| label: setup
+
+library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+library(stacks)
+library(bonsai)
+  
+library(agua)
+library(ggforce)
+
+library(corrr)
+library(GGally)
+
+    
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_set(xkcd::theme_xkcd())
+
+metrics <- metric_set(roc_auc)
+
+```
+
+## Interchangeability
+
+```{r}
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s3e12/"
+} else {
+  path <- str_c(here::here("data"),"/")
+}
+```
+
+## Load Data
+
+```{r }
+#| label: load data
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) |> 
+          distinct(across(-id), .keep_all = TRUE) |> 
+          mutate(target = factor(target,
+                                labels = c("no","stone")))
+
+competition_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE)
+
+all_df <- bind_rows(
+  raw_df |> mutate(source = "train"),
+  competition_df |> mutate(source = "competition")
+) |> mutate(source = factor(source))
+
+```
+
+```{r}
+#| label: skimr
+skimr::skim(raw_df)
+```
+
+```{r}
+#| label: skimr competition
+skimr::skim(competition_df)
+```
+
+
+## Duplicated Values
+
+Is this competition transaction already in the training data with a correct label?
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+all_df |> 
+  group_by(-id) |>  
+  mutate(num_dups = n(), 
+         dup_id = row_number()) |>  
+  ungroup() |> 
+  group_by(source, target) |> 
+  mutate(is_duplicated = dup_id > 1) |> 
+  count(is_duplicated)
+
+```
+
+This dataset appears to lack any duplicates, after applying the pre-processor.
+
+## Numerics
+
+Lets zoom in more closely on the training set only.
+
+
+```{r}
+#| label: numeric density plots
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+raw_df |> 
+  select(where(is.numeric), target) |> 
+  pivot_longer(- c(id, target),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(value, fill = target, color = NULL)) +
+  geom_density(alpha = 0.6, show.legend = TRUE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(title = "Numeric Dependant Variable Distributions")
+```
+
+
+## Q-Q
+
+
+```{r}
+#| label: qq plots
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+raw_df |> 
+  select(where(is.numeric), target) |> 
+  pivot_longer(- c(id, target),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(sample = value)) + 
+  stat_qq(aes(color = target)) + 
+  stat_qq_line(show.legend = FALSE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+## Target
+
+On to the target itself. There is a modest imbalance in this dataset.
+
+```{r }
+#| label: booking status target
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+raw_df %>% 
+  ggplot(aes(target, fill = target)) +
+  geom_bar() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(y = "Count of Samples", x = "Strength", title = "Target")
+```
+
+# Feature-target interactions {.tabset .tabset-fade .tabset-pills}
+
+## ggpairs
+
+```{r}
+#| label: interesting feature interactions
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+foo <- raw_df %>% 
+  select(where(is.numeric), -id, target) %>% 
+  drop_na() 
+
+foo %>% 
+  ggpairs(
+    columns = 1:(ncol(foo)-1),
+    mapping = aes(color = target, alpha = 0.5),
+    lower = list(continuous = wrap("points", alpha = 0.5, size=0.01)),
+    upper = list(continuous = wrap("smooth", alpha = 0.5, size = 0.1)),
+    progress = FALSE) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Pair plots: lower: scatter; upper: linear fit - color by target")
+```
+
+## Feature Search
+
+```{r}
+#| label: feature engineering search
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+nearest_neighbor_kknn_spec <-
+  nearest_neighbor(neighbors = 30, 
+                   weight_func = "inv", 
+                   dist_power = 1.12) %>%
+  set_engine('kknn') %>%
+  set_mode('classification')
+
+(
+  selector_rec <- recipe(
+    target ~ .,
+    data = raw_df
+  )  %>%
+    step_rm(id) |> 
+
+    step_interact(~ all_predictors():all_predictors()) |> 
+    
+    step_ratio(gravity, ph, osmo, cond, urea,
+               denom = denom_vars(calc)) |> 
+
+    step_nzv(all_predictors())      |> 
+    step_normalize(all_predictors()) 
+)
+
+train_selector_df <- selector_rec |> prep() |> bake(new_data = NULL)
+
+formulas <- leave_var_out_formulas(target ~ ., data = train_selector_df)
+
+folds <- vfold_cv(train_selector_df,
+                  v = 25,
+                  strata = target)
+
+quality_workflows <-
+  workflow_set(
+    preproc = formulas,
+    models = list(knn = nearest_neighbor_kknn_spec)
+  )
+
+quality_workflows <- quality_workflows %>%
+  workflow_map("fit_resamples",
+               resamples = folds,
+               metrics = metrics)
+
+roc_auc_values <-
+  quality_workflows %>%
+  collect_metrics(summarize = FALSE)  %>%
+  filter(.metric == "roc_auc") |>
+  mutate(wflow_id = gsub("_knn", "", wflow_id))
+
+full_model <-
+  roc_auc_values %>%
+  filter(wflow_id == "everything") %>%
+  select(full_model = .estimate, id)
+
+differences <-
+  roc_auc_values %>%
+  filter(wflow_id != "everything") %>%
+  full_join(full_model, by = "id") %>%
+  mutate(performance_drop = full_model - .estimate)
+
+summary_stats <-
+  differences %>%
+  group_by(wflow_id) %>%
+  summarize(
+    std_err = sd(performance_drop)/sum(!is.na(performance_drop)),
+    performance_drop = mean(performance_drop),
+    lower = performance_drop - qnorm(0.975) * std_err,
+    upper = performance_drop + qnorm(0.975) * std_err,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    wflow_id = factor(wflow_id),
+    wflow_id = reorder(wflow_id, performance_drop)
+  )
+
+summary_stats %>% filter(lower > 0) |> 
+  arrange(desc(lower))
+
+summary_stats |>
+  ggplot(aes(x = performance_drop, y = wflow_id)) +
+  geom_point() +
+  geom_errorbar(aes(xmin = lower, xmax = upper), width = .25) +
+  labs(y = NULL, title = "Leave one out Feature Differences") +
+  theme(plot.title.position = "plot")
+
+```
+
+
+There are a couple of interactions to consider that may yield a performance benefit in the modeling below.
+
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## CV
+
+This is a tiny dataset with high potential for overfitting. To get better out of sample performance estimates we are going run 25 k-folds, twice.
+
+```{r}
+#| label: make resample folds
+
+set.seed(42)
+
+folds <- vfold_cv(raw_df, 
+                  v = 25,
+                  repeats = 2,
+                  strata = target)
+
+```
+
+## GAM
+
+```{r}
+#| label: gam
+#| warning: false
+#| fig.height: 20
+#| fig.width: 12
+
+set.seed(42)
+
+gen_additive_mod_mgcv_spec <-
+  gen_additive_mod(select_features = TRUE,
+                   adjust_deg_free = 3L) %>%
+  set_engine('mgcv') %>%
+  set_mode('classification')
+
+folds <- vfold_cv(raw_df, 
+                  v = 50,
+                  strata = target)
+
+ctrl <- control_stack_resamples()
+
+wf <- workflow() |> 
+  add_variables(outcomes = c(target),
+                predictors = c(osmo, calc, gravity, cond, ph, urea)) |> 
+  add_model(gen_additive_mod_mgcv_spec, 
+            formula = target ~ 
+              s(calc) 
+            + s(osmo)  
+            + s(gravity) 
+            + s(cond)
+            + s(ph) 
+            + s(urea) 
+            + ti(gravity, urea) 
+            + ti(gravity, cond)
+            + ti(urea, calc)
+            + ti(gravity, osmo)
+            )
+
+gam_result <- fit_resamples(
+  wf,
+  resamples = folds,
+  control = ctrl,
+  metrics = metrics
+  )
+
+augment(gam_result) %>%
+  roc_curve(target, .pred_stone, event_level = "second") %>%
+  autoplot()
+
+best_gam_fit <- wf %>%
+     finalize_workflow(select_best(gam_result)) %>% 
+     fit(raw_df) 
+
+best_gam_fit |> 
+  extract_fit_engine() |> 
+  gratia::basis() |> 
+  gratia::draw(legend = TRUE,
+               ncol = 2)
+
+```
+
+## LightGBM
+
+```{r}
+#| label: lgbm
+#| warning: false
+#| fig.height: 10
+#| fig.width: 12
+
+boost_tree_lgbm_spec <- 
+    boost_tree(tree_depth = 4L, 
+               trees = 100, 
+               learn_rate = 2e-5,  #2e-5
+               min_n = 72L,  
+               mtry = 7L) %>%
+  set_engine('lightgbm') %>%
+  set_mode('classification')
+
+(
+rec <- recipe(
+    target ~ .,
+    data = raw_df
+  )  %>%
+    step_rm(id) |> 
+    
+    step_ratio(all_predictors(),
+               denom = denom_vars(calc)) |> 
+    
+    step_interact(~ gravity:urea) |>
+    step_interact(~ gravity:cond) |> 
+    step_interact(~ gravity:osmo) |> 
+    
+    step_nzv(all_predictors()) |> 
+    step_normalize(all_predictors()) |> 
+    
+    step_ns(calc, deg_free = 4L)
+)
+
+
+ctrlg <- control_stack_resamples()
+
+wf <- workflow(rec, boost_tree_lgbm_spec)
+
+lgbm_result <- fit_resamples(
+  wf,
+  resamples = folds,
+  control = ctrlg,
+  metrics = metrics
+  )
+
+augment(lgbm_result) %>%
+  roc_curve(target, .pred_stone, event_level = "second") %>%
+  autoplot()
+
+best_lgbm_fit <- wf %>%
+     finalize_workflow(select_best(lgbm_result)) %>% 
+     fit(raw_df) 
+
+best_lgbm_fit |> 
+  extract_fit_engine() |> 
+  lgb.importance() |> 
+  lightgbm::lgb.plot.importance()
+
+collect_metrics(lgbm_result) |> arrange(desc(mean))
+
+
+
+```
+
+
+## SVM
+
+```{r}
+#| label: lgbm
+#| warning: false
+#| fig.height: 10
+#| fig.width: 12
+
+svm_linear_kernlab_spec <-
+  svm_linear(cost = 5, 
+             margin = 0.1647) %>%
+  set_engine('kernlab') %>%
+  set_mode('classification')
+
+(
+rec <- recipe(
+    target ~ .,
+    data = raw_df)  %>%
+    step_rm(id) |> 
+    
+    step_interact(~ calc:urea) |>
+    step_interact(~ calc:ph) |> 
+    step_interact(~ gravity:osmo) |> 
+    step_interact(~ ph:cond) |> 
+
+    step_ratio(gravity, ph, cond, urea,
+               denom = denom_vars(calc)) |> 
+
+    step_rm(ph, osmo, calc) |> 
+
+    step_nzv(all_predictors()) |> 
+        
+    step_normalize(all_predictors())
+)
+
+
+# ctrlg <- finetune::control_sim_anneal(
+#   save_pred = TRUE
+# )
+
+ctrlg <- stacks::control_stack_resamples()
+
+wf <- workflow(rec, svm_linear_kernlab_spec)
+
+# svm_params <- wf |> 
+#   extract_parameter_set_dials() |> 
+#   update(
+#     cost = cost(),
+#     margin = dials::svm_margin()
+#   ) 
+
+svm_result <- fit_resamples(
+  wf,
+  resamples = folds,
+  control = ctrlg,
+  metrics = metrics
+  )
+
+augment(svm_result) %>%
+  roc_curve(target, .pred_stone, event_level = "second") %>%
+  autoplot()
+
+collect_metrics(svm_result) |> arrange(desc(mean))
+
+# autoplot(svm_result)
+# 
+# svm_result <- finetune::tune_sim_anneal(
+#     wf,
+#   resamples = folds,
+#   iter = 50,
+#   control = ctrlg,
+#   metrics = metrics,
+#   param_info = svm_params
+#   
+# )
+# 
+# collect_metrics(svm_result) |> 
+#   arrange(desc(mean))
+# 
+# autoplot(svm_result)
+# 
+# best_svm_fit <- wf %>%
+#      finalize_workflow(select_best(svm_result)) %>% 
+#      fit(raw_df) 
+
+
+
+```
+
+
+
+## Ranger
+
+```{r}
+#| label: ranger
+#| warning: false
+#| fig.height: 10
+#| fig.width: 12
+#| 
+rand_forest_ranger_spec <-
+  rand_forest(
+     mtry = tune(), 
+     min_n = tune()
+    ) %>%
+  set_engine('ranger') %>%
+  set_mode('classification')
+
+
+(
+rec <- recipe(
+    target ~ .,
+    data = raw_df)  %>%
+    step_rm(id) |> 
+    
+    step_interact(~ all_predictors():all_predictors()) |> 
+    
+    step_ratio(gravity, ph, osmo, cond, urea,
+               denom = denom_vars(calc)) |> 
+
+    step_nzv(all_predictors()) |> 
+    step_rm(gravity_x_urea, gravity_x_calc) |> 
+        
+    step_normalize(all_predictors())
+)
+
+
+ctrlg <- finetune::control_sim_anneal(
+  save_pred = TRUE
+)
+
+# ctrlg <- stacks::control_stack_resamples()
+
+wf <- workflow(rec, rand_forest_ranger_spec)
+
+rf_params <- wf |>
+  extract_parameter_set_dials() |>
+  recipes::update(
+    mtry = mtry(),
+    min_n = min_n()
+  ) |> finalize(raw_df)
+
+rf_result <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = 12,
+  control = ctrlg,
+  metrics = metrics,
+  param_info = rf_params
+  )
+
+augment(rf_result) %>%
+  roc_curve(target, .pred_stone, event_level = "second") %>%
+  autoplot()
+
+collect_metrics(rf_result) |> arrange(desc(mean))
+
+rf_result <- finetune::tune_sim_anneal(
+    wf,
+  resamples = folds,
+  iter = 50,
+  initial = rf_result,
+  control = ctrlg,
+  metrics = metrics,
+  param_info = rf_params
+
+)
+
+collect_metrics(rf_result) |>
+  arrange(desc(mean))
+
+autoplot(rf_result)
+
+best_rf_fit <- wf %>%
+     finalize_workflow(select_best(rf_result)) %>%
+     fit(raw_df)
+
+
+
+```
+
+
+## Nearest Neighbor
+
+```{r}
+#| label: ranger
+#| warning: false
+#| fig.height: 10
+#| fig.width: 12
+#| 
+nearest_neighbor_kknn_spec <-
+  nearest_neighbor(neighbors = tune(), 
+                   weight_func = tune(), 
+                   dist_power = tune()) %>%
+  set_engine('kknn') %>%
+  set_mode('classification')
+
+(
+rec <- recipe(
+    target ~ .,
+    data = raw_df)  %>%
+    step_rm(id) |> 
+    
+    step_interact(~ all_predictors():all_predictors()) |> 
+    
+    step_ratio(gravity, ph, osmo, cond, urea,
+               denom = denom_vars(calc)) |> 
+    
+    step_nzv(all_predictors()) |> 
+    step_rm(urea_x_calc, cond_x_calc) |> 
+        
+    step_normalize(all_predictors())
+)
+
+
+ctrlg <- finetune::control_sim_anneal(
+  save_pred = TRUE
+)
+
+# ctrlg <- stacks::control_stack_resamples()
+
+wf <- workflow(rec, nearest_neighbor_kknn_spec)
+
+nn_params <- wf |>
+  extract_parameter_set_dials() |>
+  recipes::update(
+    neighbors = dials::neighbors(range = c(5, 50)), 
+    weight_func = dials::weight_func(), 
+   dist_power =   dials::dist_power()
+  ) |> finalize(raw_df)
+
+nn_result <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = 12,
+  control = ctrlg,
+  metrics = metrics,
+  param_info = nn_params
+  )
+
+augment(nn_result) %>%
+  roc_curve(target, .pred_stone, event_level = "second") %>%
+  autoplot()
+
+collect_metrics(nn_result) |> arrange(desc(mean))
+
+nn_result <- finetune::tune_sim_anneal(
+    wf,
+  resamples = folds,
+  iter = 50,
+  initial = nn_result,
+  control = ctrlg,
+  metrics = metrics,
+  param_info = nn_params
+
+)
+
+collect_metrics(nn_result) |>
+  arrange(desc(mean))
+
+autoplot(nn_result)
+
+
+
+```
+
+# Ensemble
+
+```{r}
+#| label: stacks
+ens <- stacks() |>
+  stacks::add_candidates(lgbm_result) |>
+  stacks::add_candidates(svm_result) |>
+  stacks::blend_predictions(
+    metric = metric_set(roc_auc),
+    penalty = c(seq(0.15, 0.25, 0.001)),
+    mixture = c(seq(0.6, 0.95, 0.05)),
+    non_negative = FALSE,
+    control = tune::control_grid(allow_par = TRUE,
+                                 event_level = "second")
+  ) 
+
+autoplot(ens)
+
+autoplot(ens, "weights")
+
+ensemble <- fit_members(ens)
+
+```
+
+
+
+
+# Submission
+
+
+```{r}
+
+submission_df <- predict(best_rf_fit, competition_df, type = "prob") |>
+  bind_cols(competition_df) |>
+  mutate(target = .pred_stone, id = as.integer(id)) |> 
+  select(id,target)
+
+submission_df |> 
+  ggplot(aes(target)) +
+  geom_histogram()
+
+submission_df %>%
+  write_csv(str_c(path, "submission.csv"))
+```
+
+
+
+

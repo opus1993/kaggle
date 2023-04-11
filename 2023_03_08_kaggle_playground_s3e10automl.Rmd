@@ -1,0 +1,428 @@
+---
+title: "Pulsar Classification Season3 Episode10"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+# Introduction  
+
+<div 
+    style="background-image: url('https://images.unsplash.com/photo-1520034475321-cbe63696469a?ixlib=rb-4.0.3&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=1470&q=80'); 
+    width:100%; 
+    height:600px; 
+    background-position:center;">&nbsp;
+</div>
+
+*Photo by Unsplash.*
+
+The dataset for this competition (both train and test) was derived from a deep learning model trained on the pulsar dataset. 
+
+My notebook serves as a clean demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+# Preparation {.tabset .tabset-fade .tabset-pills}
+
+## Load libraries
+
+```{r }
+#| label: setup
+
+suppressPackageStartupMessages({
+library(tidyverse) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+
+library(agua)
+
+library(corrr)
+library(GGally)
+
+})
+    
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_set(theme_bw())
+
+metrics <- metric_set(mn_log_loss)
+
+```
+
+## Interchangeability
+
+```{r}
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s3e10/"
+} else {
+  path <- str_c(here::here("data"),"/")
+}
+```
+
+## Load Data
+
+```{r }
+#| label: load data
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) |> 
+          distinct(across(-id), .keep_all = TRUE) |> 
+          mutate(Class = factor(Class,
+                                labels = c("no","pulsar")))
+
+competition_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE)
+
+all_df <- bind_rows(
+  raw_df |> mutate(source = "train"),
+  competition_df |> mutate(source = "competition")
+) |> mutate(source = factor(source))
+
+```
+
+```{r}
+#| label: skimr
+skimr::skim(raw_df)
+```
+
+```{r}
+#| label: skimr competition
+skimr::skim(competition_df)
+```
+
+COLUMNS:
+Based on Integrated Profile of Observation
+
+Mean_Integrated: Mean of Observations
+
+SD: Standard deviation of Observations
+
+EK: Excess kurtosis of Observations
+
+Skewness:  Skewness of Observations.
+
+Mean _ DMSNR _ Curve: Mean of DM SNR CURVE of Observations
+
+SD _ DMSNR _ Curve: Standard deviation of DM SNR CURVE of Observations
+
+EK _ DMSNR _ Curve: Excess kurtosis of DM SNR CURVE of Observations
+
+Skewness _ DMSNR _ Curve: Skewness of DM SNR CURVE of Observations
+
+Class: Class 0 - 1
+
+## Duplicated Values
+
+Is this competition transaction already in the training data with a correct label?
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+all_df |> 
+  group_by(-id) |>  
+  mutate(num_dups = n(), 
+         dup_id = row_number()) |>  
+  ungroup() |> 
+  group_by(source, Class) |> 
+  mutate(is_duplicated = dup_id > 1) |> 
+  count(is_duplicated)
+
+```
+
+This dataset appears to lack any duplicates, after applying the pre-processor.
+
+## Numerics
+
+Lets zoom in more closely on the training set only.
+
+
+```{r}
+#| label: numeric density plots
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+raw_df |> 
+  select(where(is.numeric), Class) |> 
+  pivot_longer(- c(id, Class),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  filter(value > 0.1) |> 
+  ggplot(aes(value, fill = Class, color = NULL)) +
+  geom_density(alpha = 0.6, show.legend = FALSE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+## Q-Q
+
+
+```{r}
+#| label: qq plots
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+all_df |> 
+  select(where(is.numeric), Class) |> 
+  pivot_longer(- c(id, Class),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(sample = value)) + 
+  stat_qq(aes(color = Class)) + 
+  stat_qq_line(show.legend = FALSE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = c(0.8, 0.15))
+```
+
+## Target: Class
+
+On to the target itself. There is a pretty big imbalance in this dataset.
+
+```{r }
+#| label: booking status target
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+raw_df %>% 
+  ggplot(aes(Class, fill = Class)) +
+  geom_bar() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(y = "Count of Samples", x = "Strength", title = "Target: Class")
+```
+
+# Feature-target interactions {.tabset .tabset-fade .tabset-pills}
+
+## ggpairs
+
+```{r}
+#| label: interesting feature interactions
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+foo <- raw_df %>% 
+  select(where(is.numeric), -id, Class) %>% 
+  drop_na() 
+
+foo %>% 
+  ggpairs(
+    columns = 1:(ncol(foo)-1),
+    mapping = aes(color = Class, alpha = 0.5),
+    lower = list(continuous = wrap("points", alpha = 0.3, size=0.01)),
+    upper = list(continuous = wrap("smooth", alpha = 0.005, size = 0.1)),
+    progress = FALSE) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Pair plots: lower: scatter; upper: linear fit - color by target")
+```
+
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+
+## Parallel
+
+Too speed computation, we will load up a parallel backend.
+
+```{r}
+#| label: assign a parallel backend
+
+all_cores <- parallelly::availableCores()
+all_cores
+
+future::plan("multisession", workers = all_cores) 
+
+```
+
+
+# Split
+
+```{r}
+#| label: split
+h2o::h2o.init(nthreads = all_cores)
+
+split <- initial_split(raw_df, prop = 0.94, strata = Class)
+
+train_df <- training(split)
+test_df <- testing(split)
+
+```
+
+## Parsnip engines
+
+```{r}
+#| label: model specifications
+
+
+h2o_spec <- boost_tree() %>%
+  set_engine("h2o", 
+            # max_runtime_secs = 360, 
+             seed = 1,
+             calibrate_model = TRUE,
+             calibration_frame = calib_frame,
+             stopping_metric = "logloss"
+             ) %>%
+  set_mode("classification")
+
+```
+
+## Preprocessing Recipe
+
+
+```{r}
+#| label: set the recipe
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+(rec <- recipe(Class ~ ., data = train_df )  %>% 
+  step_rm(id) %>%
+  step_range(Skewness, Skewness_DMSNR_Curve) %>%
+  step_log(Skewness, Mean_DMSNR_Curve, SD_DMSNR_Curve, Skewness_DMSNR_Curve, offset = 0.001) %>%
+  step_sqrt(Mean_Integrated) %>%
+ 
+  step_interact(~ EK_DMSNR_Curve:Skewness_DMSNR_Curve) |> 
+  step_interact(~ EK:Skewness_DMSNR_Curve) |> 
+  step_interact(~ Mean_DMSNR_Curve:SD_DMSNR_Curve) |> 
+  step_interact(~ SD:EK_DMSNR_Curve) |> 
+   step_interact(~ SD:EK) |> 
+   step_interact(~ SD:Mean_DMSNR_Curve) |> 
+   step_interact(~ SD:Skewness_DMSNR_Curve) |> 
+   step_interact(~ Skewness:Mean_DMSNR_Curve) |> 
+   step_interact(~ Skewness:SD_DMSNR_Curve) |> 
+   step_interact(~ Skewness:Skewness_DMSNR_Curve) |> 
+   
+  step_poly(all_predictors(), degree = 2) %>%
+  step_ns(all_predictors(), deg_free = 2) |> 
+  step_corr(all_predictors(), threshold = 0.96) |> 
+
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_spatialsign(all_predictors()) 
+)
+
+rec |> prep() |> bake(new_data = NULL) |>
+  corrr::correlate(quiet = TRUE) |> 
+  rearrange() %>% 
+  shave() %>% 
+  rplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0, hjust=1))
+
+```
+
+## h2o 
+
+```{r}
+#| label:  h2o xgb
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+training_frame <- h2o::as.h2o(rec |> prep() |> bake(new_data = train_df))
+calib_frame <- h2o::as.h2o(rec |> prep() |> bake(new_data = test_df))
+
+# model <- h2o::h2o.xgboost(x = 2:55,
+#                  y = "Class",
+#                  training_frame = training_frame,
+#                    max_runtime_secs = 600,
+#                  ntrees = 80,
+#                  max_depth = 5,
+#                  min_rows = 3,
+#                  min_child_weight = 3,
+#                  sample_rate = 0.8,
+#                  subsample = 0.8,
+#                  col_sample_rate = 0.8,
+#                  colsample_bylevel = 0.8,
+#                  col_sample_rate_per_tree = 0.8,
+#                  colsample_bytree = 0.8,
+#                  score_tree_interval = 5,
+#                 calibrate_model = TRUE,
+#                 stopping_metric = "logloss",
+#                 stopping_rounds = 250,
+#                 eval_metric = "logloss",
+#                 nfolds = 7,
+#                   keep_cross_validation_predictions = FALSE,
+#                 calibration_frame = calib_frame,
+#                 calibration_method = "IsotonicRegression",
+#                 validation_frame = calib_frame
+#                  )
+
+model <- h2o::h2o.automl(x = 2:55,
+                 y = "Class",
+                 training_frame = training_frame,
+                 max_runtime_secs = 6*60*60,
+                stopping_metric = "logloss",
+                sort_metric = "logloss",
+                stopping_rounds = 250,
+                include_algos = c("XGBoost","GBM"),
+                nfolds = 7,
+                  keep_cross_validation_predictions = FALSE
+                 )
+
+
+# lb <- h2o::h2o.get_leaderboard(object = model, extra_columns = "ALL")
+# lb
+
+# Get the best XGBoost model using default sort metric
+# xgb <- h2o::h2o.get_best_model(model, algorithm = "xgboost", criterion = "logloss")
+
+# xgb@parameters
+
+model@leaderboard
+
+h2o::h2o.varimp_heatmap(model)
+
+# h2o::h2o.performance(model)  
+
+# h2o::h2o.permutation_importance(model, newdata = calib_frame) 
+
+h2o::h2o.logloss(xgb)
+
+```
+
+
+# Submission
+
+
+```{r}
+
+submission_df <- h2o::h2o.predict(model, h2o::as.h2o(rec |> prep() |> bake(new_data = competition_df))) |> 
+  as_tibble() |> 
+  bind_cols(competition_df) |>
+  mutate(Class = pulsar, id = as.integer(id)) |> 
+  select(id,Class)
+
+submission_df |> 
+  ggplot(aes(Class)) +
+  geom_histogram()
+
+submission_df %>%
+  write_csv(str_c(path, "submission.csv"))
+```
+
+
+
+

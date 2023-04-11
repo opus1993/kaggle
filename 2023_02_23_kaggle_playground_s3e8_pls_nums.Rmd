@@ -1,0 +1,519 @@
+---
+title: "Gemstone Price Playground Series Season3 Episode8"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+# Introduction  
+
+<div 
+    style="background-image: url('https://images.unsplash.com/photo-1585383234137-2367d3c5302d?ixlib=rb-4.0.3&ixid=MnwxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8&auto=format&fit=crop&w=1470&q=80'); 
+    width:100%; 
+    height:600px; 
+    background-position:center;">&nbsp;
+</div>
+
+*Photo by Dan Farrell on Unsplash.*
+
+The dataset for this competition (both train and test) was derived from a deep learning model trained on the [Gemstone Price Prediction](https://www.kaggle.com/datasets/colearninglounge/gemstone-price-prediction) dataset. 
+
+My notebook serves as a clean demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+# Preparation {.tabset .tabset-fade .tabset-pills}
+
+## Load Libraries
+
+We load a range of libraries for general data wrangling and general visualisation together with more specialised tools.
+
+```{r }
+#| label: setup
+
+suppressPackageStartupMessages({
+library(tidyverse) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+
+library(corrr) # a handy pairwise correlations tool
+library(GGally) # plotting extensions for ggplot2 for EDA
+
+library(h2o)
+library(agua)
+
+})
+    
+tidymodels_prefer()
+
+theme_set(ggplot2::theme_light())
+
+metrics <- metric_set(rmse)
+
+```
+## Load data
+
+Were setting a path structure that will allow us to run this notebook locally and on Kaggle without having to manually change the file paths from one platform to the other:
+
+```{r}
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s3e7/"
+} else {
+  path <- str_c(here::here("data"),"/")
+}
+```
+
+This pre-processor function is meant to apply equally on the training data and the unlabeled competition dataset.
+
+Some of the bogus numeric dates appear in both training and testing, so they cannot be filtered out. I am choosing to lump them onto the last actual day of the month to make feature engineering later much easier.
+
+
+```{r }
+#| label: load data
+
+factors <- c("cut", "color", "clarity")
+
+preprocessor <- function(data){
+  data %>%
+    janitor::clean_names() %>% 
+    mutate(clarity = factor(clarity,
+                            levels = c("FL", "IF", "VVS1", "VVS2", "VS1", "VS2", "SI1", "SI2", "I1", "I2", "I3"),
+                            ordered = TRUE),
+           color = factor(color,
+                          levels = c("D","E","F","G","H","I","J"),
+                          ordered = TRUE),
+           cut = factor(cut,
+                        levels = c("Ideal","Premium","Very Good","Good","Fair"),
+                        ordered = TRUE),
+           x = if_else(x == 0, NA_real_, x),
+           y = if_else(y == 0, NA_real_, y),
+           z = if_else(z == 0, NA_real_, z),
+
+           temp = x,           
+           x = if_else(x > y, x, y),
+           y = if_else(x > y, y, temp),
+           
+           id = as.character(id),
+           across(where(base::is.numeric), base::log)) |> 
+    select(-temp)
+
+}
+
+raw_df <- read_csv(str_c(path,"train.csv"),
+                   show_col_types = FALSE) %>%
+          preprocessor() %>% 
+          distinct(across(-id), .keep_all = TRUE) 
+
+competition_df <- read_csv(str_c(path,"test.csv"),
+                   show_col_types = FALSE) %>% 
+          preprocessor()
+
+all_df <- bind_rows(
+  raw_df %>% mutate(source = "train"),
+  competition_df %>% mutate(source = "competition")
+)  %>%  mutate(source = factor(source))
+
+
+```
+
+## Overview: Structure and Data Content
+
+The first thing you want to do is to look at your actual data in its raw form. This will tell you about the types of features youre dealing with (numeric, categorical, string, etc.), as well as already reveal some characteristics of the dataset. This includes checking for missing values.
+
+Generally, we dont want to look at the test data any more than strictly necessary. The test dataset is intended to serve as our final model validation, and should only include data that the model has never seen before. Since our brain is part of the modelling process as well (or at least it should be), we want to avoid picking up any signal in the test data that could consciously or unconsciously influence our decisions. Thus, this EDA will almost entirely focus on the `train.csv` data.
+
+I walk through a process using *skimr* of exploring each variable at the console. Some are obviously multi-level categories. Others imply calendar dates.
+
+```{r}
+#| label: skimr
+skimr::skim(raw_df)
+```
+
+```{r}
+#| label: skimr competition
+skimr::skim(competition_df)
+```
+
+
+From:  [https://www.everything-wedding-rings.com/images/diamondanatomyimproved.jpg](https://www.everything-wedding-rings.com/images/diamondanatomyimproved.jpg)
+
+![](https://www.googleapis.com/download/storage/v1/b/kaggle-forum-message-attachments/o/inbox%2F1382879%2F9d53be48c1bf1c98e6fba36f45cf421a%2Fdiamondanatomyimproved.jpg?generation=1676968869360324&alt=media)
+
+**Carat**	Carat weight of the cubic zirconia
+**Color**	Colour of the cubic zirconia.With D being the best and J the worst
+**Clarity** cubic zirconia Clarity refers to the absence of the Inclusions and Blemishes. 
+
+Depth: The Height of cubic zirconia, measured from the culet to the table, divided by its average Girdle Diameter.
+X: Length of the cubic zirconia in mm.
+Y: Width of the cubic zirconia in mm.
+Z: Height of the cubic zirconia in mm.
+
+## Missing Values
+
+Lets have a closer look at any missing values. How many are there in total in the train and competition datasets?
+
+
+```{r}
+glue::glue("The train set has { sum(is.na(raw_df)) } missing values, and the test set has { sum(is.na(competition_df)) }.")
+```
+
+Note here that my pre-processor inserted NAs in place of the zero dimensions x, y, and z.
+
+
+# Predictor Features {.tabset .tabset-fade .tabset-pills}
+
+## Numeric 
+
+```{r}
+#| label: numeric features
+#| fig.height: 12
+#| fig.width: 13
+all_df  %>% 
+  select(where(base::is.numeric), id, source)  %>%  
+  pivot_longer(- c(id, source),
+    names_to = "metric",
+    values_to = "value"
+  )  %>% 
+  ggplot(aes(value, fill = source)) +
+  geom_histogram(aes(y =  after_stat(density)),alpha = 0.6, bins = 50) +
+  geom_density(alpha = 0.1, position = "dodge") +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+labs(title = "Numeric Feature Value density plots in combined train and test")
+
+```
+
+## Q-Q
+
+```{r}
+#| label: qq plots
+#| fig.height: 12
+#| fig.width: 13
+
+all_df %>% 
+  select(where(base::is.numeric), source)  %>%  
+  pivot_longer(- c(source),
+    names_to = "metric",
+    values_to = "value"
+  )  %>% 
+  ggplot(aes(sample = value, color = source)) + 
+  stat_qq(show.legend = FALSE) + 
+  stat_qq_line(show.legend = FALSE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(title = "Log transformed QQ plots versus a normal distribution")
+
+
+
+```
+
+
+## Categorical counts
+
+```{r }
+#| fig.height: 5
+#| fig.width: 9
+#| label: categorical features1
+
+raw_df %>% 
+  drop_na() %>% 
+  group_by(clarity, cut, color) |> 
+  summarize(price = mean(price),
+            .groups = "drop") |> 
+  gather("type", "value", -price) |> 
+  # pivot_longer(cols = -price,
+  #              names_to = "type",
+  #              values_to = "value") |> 
+  ggplot(aes(value, fill = ggplot2::cut_number(price, 5))) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ type, scales = "free", ncol = 2)+
+  scale_fill_brewer(type = "seq") +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "top") +
+  labs(title = "Target impact - categorical features",
+       fill = "Price")
+```
+
+## Target: Price
+
+On to the target itself. We figured out that `price` is a continuous feature, and always positive (logged here).
+
+```{r }
+#| label: booking status target
+raw_df %>% 
+  ggplot(aes(price)) +
+  geom_histogram(bins = 40) +
+  scale_y_continuous(labels = scales::comma) +
+  theme(legend.position = "none") +
+  labs(y = "Count of Gems", x = "Log of Price", title = "Target: Gemstone Price")
+```
+
+# Feature-target interactions {.tabset .tabset-fade .tabset-pills}
+
+## Heatmap1
+
+Here, we will start with the heatmap and 2d-density plots and add facetting by `Color` and breaks of the z/depth ratio:
+
+```{r }
+#| label: feature target interaction
+#| fig.height: 12
+raw_df %>% 
+  drop_na() %>% 
+  group_by(cut, clarity, color, aspect_group = ggplot2::cut_number(z/depth, 4)) %>% 
+  summarise(price = mean(price, na.rm = TRUE),
+            .groups = "drop") %>% 
+  ggplot(aes(clarity, cut, fill = price)) +
+  geom_tile() +
+  scale_fill_distiller(palette = "YlOrRd") +
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  facet_grid(aspect_group ~ color) +
+  theme(legend.position = "right",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),) +
+  labs(title = "Small multiple plots of Color and Aspect ratio group")
+
+
+
+```
+
+
+## Heatmap2
+
+I wonder what we get in looking at the difference between normal carat weights, and exceptional ones.
+
+```{r }
+#| label: feature target interaction
+#| fig.height: 12
+raw_df %>% 
+  drop_na() %>% 
+  group_by(cut, clarity, color, weight_group = ggplot2::cut_number(carat, 3)) %>% 
+  summarise(price = mean(price, na.rm = TRUE),
+            .groups = "drop") %>% 
+  ggplot(aes(clarity, cut, fill = price)) +
+  geom_tile() +
+  scale_fill_distiller(palette = "YlOrRd") +
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  facet_grid(weight_group ~ color) +
+  theme(legend.position = "right",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),) +
+  labs(title = "Small multiple plots of Color and Carat weight")
+
+
+
+```
+
+
+## ggpairs
+
+We can employ the `ggpairs` function to get a quick overview of potentially interesting feature interacations and their target impact:
+
+```{r}
+#| label: interesting feature interactions
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+foo <- raw_df %>% 
+  select(where(base::is.numeric), price) %>% 
+  drop_na() 
+
+foo %>% 
+  ggpairs(
+    columns = 1:(ncol(foo)-1),
+    mapping = aes(color = ggplot2::cut_number(price, 5), alpha = 0.5),
+    lower = list(continuous = wrap("points", alpha = 0.3, size=0.01)),
+    upper = list(continuous = wrap("smooth", alpha = 0.005, size = 0.1)),
+    progress = FALSE) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Pair plots: lower: scatter; upper: linear fit - color by target")
+
+```
+
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## Parallel
+
+Too speed computation, we will load up a parallel backend.
+
+```{r}
+#| label: assign a parallel backend
+
+all_cores <- parallelly::availableCores()
+all_cores
+
+future::plan("multisession", workers = all_cores) 
+```
+
+## Parsnip engines
+
+The models themselves are handled by the `parsnip` package. It includes pretty much all the popular models, including the random forests and tree boosters. 
+
+The parameters are pretty straightforward. For example, we're using a lasso regression model, indicated by `mixture = 1`. (A `mixture = 0` would be a pure ridge model, i.e. L1 regularisation, and anything between 0 and 1 is possible.) 
+
+We define a handful of other classification engines, including xgboost and lightgbm as well.
+
+```{r}
+#| label: model specifications
+
+auto_spec <-
+  auto_ml() %>%
+  set_engine("h2o", 
+             max_runtime_secs = 360, 
+             validation = 0.1,
+             seed = 42) %>%
+  set_mode("regression")
+
+```
+
+## Preprocessing recipes
+
+This is easily the step we're putting the most thought into, since we want to apply some of the things we've learnt during the EDA. The data preprocessing package within `tidymodels` is called `recipes`.
+
+We're taking the `id` column along, but we don't want it to be affected by any of the processing. This is achieved using "roles".
+
+Any imputing of missing values would be done here, if needed. There are multiple imputation functions available within `recipes`. For inspiration on how to treat missing values check out [Rob's Notebook](https://www.kaggle.com/robikscube/handling-with-missing-data-youtube-stream). 
+
+We then apply a one-hot encoding to the categorical features. That's not really necessary for many of the tree model types. We will also normalise all numerical features.
+
+We will apply polynomial expansions, non linear basis splines, and interactions as indicated in the EDA above.
+
+The gems in this model may have pricing at a discount due to shape issues.  Let's build a few flags and make glm embedding to account for it.
+
+And finally, we eliminate features with low variance and normalize everything.
+
+I like to make a check one more time of the transformed feature correlations. Here, the week feature and the quarter feature are correlated, which makes sense. A regularization penalty will drop one or both of them.
+
+Be cognizant of correlated features in the variable importance scores as well.
+
+```{r}
+#| label: set the recipe
+rec <- recipe(price ~ .,
+         data = raw_df )  %>% 
+  update_role(id, new_role = "id")  |> 
+  step_impute_bag(x, y,
+                  impute_with = imp_vars(table, carat)) |> 
+  step_impute_bag(z,
+                  impute_with = imp_vars(depth, carat)) |> 
+
+  step_mutate(odd_geometry = case_when(x/y > 1.005 ~ "x_y",
+                                       z/depth < 0.259 ~ "z_depth",
+                                       z/table < 0.264 ~ "z_table",
+                                       TRUE ~ "normal")) |>
+  embed::step_lencode_glm(odd_geometry, outcome = vars(price)) |> 
+  
+  step_ordinalscore(all_nominal_predictors()) |> 
+  step_normalize(all_numeric_predictors()) 
+
+
+rec |> prep() |> bake(new_data = NULL) |> 
+  corrr::correlate(quiet = TRUE) |> 
+  rearrange() %>% 
+  shave() %>% 
+  rplot() +
+  scale_x_discrete(guide = guide_axis(n.dodge = 3))
+
+```
+
+
+## H2O
+
+```{r}
+#| label: h2o auto 
+
+h2o_start()
+
+auto_fit <- fit(workflow(rec, auto_spec), data = raw_df)
+
+agua::rank_results(auto_fit) %>%
+  filter(.metric == "rmse") %>%
+  arrange(rank)
+
+autoplot(auto_fit, type = "rank", metric = "rmse") +
+  theme(legend.position = "none")
+
+predict(auto_fit, raw_df) |> 
+  bind_cols(raw_df) |> 
+  mutate(.pred = exp(.pred), price = exp(price)) |> 
+  rmse(price, .pred)
+
+predict(auto_fit, raw_df) |>
+  bind_cols(raw_df) |>
+  ggplot(aes(exp(price), exp(price) - exp(.pred), color = color)) +
+  geom_point()
+
+predict(auto_fit, raw_df) |>
+  bind_cols(raw_df) |>
+  mutate(price = exp(price), residual = price - exp(.pred)) |> 
+  filter(abs(residual) > 7000) |>
+  select(residual, price, id, color, clarity, cut, x, y, z, depth) 
+
+```
+
+
+```{r}
+#| label:  h2o agua further tuning
+
+auto_spec_refit <-
+  auto_ml() %>%
+  set_engine("h2o",
+             max_runtime_secs = 400,
+             save_data = TRUE,
+             validation = 0.1,
+             keep_cross_validation_predictions = TRUE) %>%
+  set_mode("regression")
+
+auto_wflow_refit <-
+  workflow() %>%
+  add_model(auto_spec_refit) %>%
+  add_recipe(rec)
+
+refit <- fit(auto_wflow_refit, data = raw_df)
+
+agua::rank_results(refit) %>%
+  filter(.metric == "rmse") %>%
+  arrange(rank)
+
+predict(refit, raw_df) |>
+  bind_cols(raw_df) |>
+  ggplot(aes(exp(price), exp(price) - exp(.pred), color = color)) +
+  geom_point() +
+  labs(title = "Training set residuals") +
+  coord_fixed()
+
+predict(refit, raw_df) |> 
+  bind_cols(raw_df) |> 
+  mutate(.pred = exp(.pred), price = exp(price)) |> 
+  rmse(price, .pred)
+
+submission <- predict(refit, competition_df) |>
+  bind_cols(competition_df) |>
+  mutate(price = exp(.pred)) |> 
+  select(id,price)
+
+
+```
+
+And the moment of truth:
+
+```{r}
+#| label: submission
+
+submission %>%
+  ggplot(aes(price)) +
+  geom_histogram(bins = 40)
+
+submission %>%
+  write_csv(here::here("data", "submission.csv"))
+```

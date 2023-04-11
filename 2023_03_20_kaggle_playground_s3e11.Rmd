@@ -1,0 +1,1088 @@
+---
+title: "Media Campaign Cost Season3 Episode11"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+# Introduction  
+
+<div 
+    style="background-image: url('https://storage.googleapis.com/kaggle-datasets-images/new-version-temp-images/default-backgrounds-81.png-4760409/dataset-cover.png'); 
+    width:100%; 
+    height:600px; 
+    background-position:center;">&nbsp;
+</div>
+
+The dataset for this competition (both train and test) was derived from a deep learning model trained on the [media campaign cost](https://www.kaggle.com/datasets/gauravduttakiit/media-campaign-cost-prediction) dataset. Our challenge is to to predict `cost`.
+
+My notebook serves as a clean demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+# Preparation {.tabset .tabset-fade .tabset-pills}
+
+## Load libraries
+
+```{r }
+#| label: setup
+
+suppressPackageStartupMessages({
+library(tidyverse) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+
+  
+library(bonsai)
+library(stacks)
+
+  
+library(corrr)
+library(GGally)
+
+})
+    
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_set(xkcd::theme_xkcd())
+
+```
+
+## Root Mean Squared Log Error
+
+
+```{r}
+#| label: custom RMSLE metric
+
+rmsle_vec <- function(truth, estimate, na_rm = TRUE, ...) {
+  
+  rmsle_impl <- function(truth, estimate) {
+
+      sqrt(mean((log1p(truth) - log1p(estimate))^2))
+    
+  }
+  
+  metric_vec_template(
+    metric_impl = rmsle_impl,
+    truth = truth, 
+    estimate = estimate,
+    na_rm = na_rm,
+    cls = "numeric",
+    ...
+  )
+  
+}
+
+rmsle <- function(data, ...) {
+  UseMethod("rmsle")
+}
+
+rmsle <- new_numeric_metric(rmsle, direction = "minimize")
+
+rmsle.data.frame <- function(data, truth, estimate, na_rm = TRUE, ...) {
+  
+  metric_summarizer(
+    metric_nm = "rmsle",
+    metric_fn = rmsle_vec,
+    data = data,
+    truth = !! enquo(truth),
+    estimate = !! enquo(estimate), 
+    na_rm = na_rm,
+    ...
+  )
+  
+}
+
+metrics <- metric_set(rmsle)
+
+```
+
+
+
+
+## Interchangeability
+
+```{r}
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s3e11/"
+} else {
+  path <- str_c(here::here("data"),"/")
+}
+```
+
+## Load Data
+
+```{r }
+#| label: load data
+
+preprocessor <- function(rawdata){
+  rawdata |> 
+     janitor::clean_names() |> 
+     mutate(store_perks = coffee_bar + video_store + salad_bar + prepared_food + florist,
+            independent_children = total_children - num_children_at_home,
+            store_sales_per_unit = store_sales_in_millions / unit_sales_in_millions,
+       across(all_of(c("total_children","num_children_at_home","avg_cars_at_home_approx_1",
+                       "coffee_bar", "video_store", "salad_bar", "prepared_food", "florist",
+                       "low_fat", "recyclable_package")), as.integer)
+       )
+}
+
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) |> 
+          distinct(across(-id), .keep_all = TRUE) |> 
+          preprocessor()
+
+competition_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE) |> 
+                  preprocessor()
+
+all_df <- bind_rows(
+  raw_df |> mutate(source = "train"),
+  competition_df |> mutate(source = "competition")
+) 
+
+```
+
+```{r}
+#| label: skimr
+skimr::skim(raw_df)
+```
+
+```{r}
+#| label: skimr competition
+skimr::skim(competition_df)
+```
+
+Food Mart (CFM) is a chain of convenience stores in the United States. Headquartered in Mentor, Ohio, the privately held company currently has approximately 325 stores in the United States. Convenience food supermarkets adopt a franchise system.
+Food Mart was the third largest convenience store chain in the country in 1988.
+
+The Nasdaq stock market fell Convenience Food Mart that same year after the company failed to meet financial reporting requirements. We are let to believe that this dataset comes from the litigation.
+
+* ```store_sales(in millions)``` - store_sales(in million dollars)
+* ```unit_sales(in millions)``` - unit_sales(in millions) in stores Quantity
+* ```Total_children``` - TOTAL CHILDREN IN HOME
+* ```avg_cars_at home(approx)``` - avg_cars_at home(approx)
+* ```Num_children_at_home``` - num_children_at_home AS PER CUSTOMERS FILLED DETAILS
+* ```Gross_weight``` - gross_weight OF ITEM
+* ```Recyclable_package``` - FOOD ITEM IS recyclable_package
+* ```Low_fat``` - LOW_FAT FOOD ITEM IS LOW FAT
+* ```Units_per_case``` - UNITS/CASE UNITS AVAILABLE IN EACH STORE SHELVES
+* ```Store_sqft``` - STORE AREA AVAILABLE IN SQFT
+* ```Coffee_bar``` - COFFEE BAR available in store
+* ```Video_store``` - VIDEO STORE/gaming store available
+* ```Salad_bar``` - SALAD BAR available in store
+* ```Prepared_food``` - food prepared available in store
+* ```Florist``` - flower shelves available in store
+* ```Cost``` - COST of ACQUIRING A new CUSTOMER in dollars
+
+
+## Duplicated Values
+
+Is this competition transaction already in the training data?
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+all_df |> 
+  group_by(-id) |>  
+  mutate(num_dups = n(), 
+         dup_id = row_number()) |>  
+  ungroup() |> 
+  group_by(source) |> 
+  mutate(is_duplicated = dup_id > 1) |> 
+  count(is_duplicated)
+```
+
+
+There are 3 SKUs that only exist in the competition set, based on gross_weight.
+
+
+```{r}
+all_df |> 
+  count(gross_weight, source) |> 
+  pivot_wider(names_from = source,
+              values_from = n) |> 
+  filter(is.na(competition) | is.na(train))
+
+
+```
+
+We can begin to identify the "real" SKUs when we count the gross_weights against recyclable packaging. In some cases the neural net has invented new combinations, and the new ones may only exist in the competition set.  These are the first 30 of 387 combinations.
+
+```{r}
+all_df |> 
+  count(gross_weight, recyclable_package, source) |> 
+  pivot_wider(names_from = c(source, recyclable_package),
+              values_from = n) |> 
+  slice_head(n = 30)
+
+
+```
+
+It's a bit of a relief that the number of children at home is often less than the total children in a household demographic. But not always.
+
+```{r}
+all_df |> 
+  count(num_children_at_home, total_children, source) |> 
+  pivot_wider(names_from = c(source, total_children),
+              values_from = n) |> 
+  slice_head(n = 30)
+
+
+```
+
+
+## Numerics
+
+Lets zoom in more closely on the training set only.
+
+
+```{r}
+#| label: numeric density plots
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+raw_df |>
+  select(where(is.numeric)) |>
+  mutate(cost = ggplot2::cut_number(cost, 5)) |>
+  pivot_longer(- c(id, cost),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  ggplot(aes(value, fill = cost, color = NULL)) +
+  geom_histogram(alpha = 0.6) +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+## Q-Q
+
+
+```{r}
+#| label: qq plots
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+all_df |>
+  select(where(is.numeric)) |>
+  mutate(cost = ggplot2::cut_number(cost, 5)) |>
+  pivot_longer(- c(id, cost),
+    names_to = "metric",
+    values_to = "value"
+  ) |>
+  ggplot(aes(sample = value)) +
+  stat_qq(aes(color = cost)) +
+  stat_qq_line(show.legend = FALSE) +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = c(0.8, 0.15))
+```
+
+## Categorical counts
+
+```{r }
+#| fig.height: 5
+#| fig.width: 9
+#| label: categorical features1
+#| fig.height: 10
+#| fig.width: 12
+
+raw_df %>%
+  select(where(is.factor), cost) |>
+  group_by(across(-any_of(c("id", "cost")))) |>
+  summarize(cost = mean(cost),
+            .groups = "drop") |>
+  gather("type", "value", -cost) |>
+  # pivot_longer(cols = -price,
+  #              names_to = "type",
+  #              values_to = "value") |>
+  ggplot(aes(value, fill = ggplot2::cut_number(cost, 5))) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ type, scales = "free", ncol = 2)+
+  scale_fill_brewer(type = "seq") +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "top") +
+  labs(title = "Target impact - categorical features",
+       fill = "Cost", x = NULL)
+```
+
+## Target: Cost
+
+On to the target itself. There is a pretty big imbalance in this dataset.
+
+```{r }
+#| label: booking status target
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+raw_df %>% 
+  ggplot(aes(cost)) +
+  geom_histogram(bins = 50) +
+  labs(y = "Count of Samples", x = NULL, title = "Target: Cost")
+```
+
+# Feature-target interactions {.tabset .tabset-fade .tabset-pills}
+
+## ggpairs
+
+```{r}
+#| label: interesting feature interactions
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+foo <- raw_df %>%
+  select(where(is.numeric), -id) %>%
+  mutate(cost = ggplot2::cut_number(cost, 5)) |>
+  drop_na()
+
+foo %>%
+  ggpairs(
+    columns = 1:(ncol(foo)-1),
+    mapping = aes(color = cost, alpha = 0.5),
+    lower = list(continuous = wrap("points", alpha = 0.3, size=0.01)),
+    upper = list(continuous = wrap("smooth", alpha = 0.005, size = 0.1)),
+    progress = FALSE) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Pair plots: lower: scatter; upper: linear fit - color by target")
+```
+
+## Feature Search
+
+```{r}
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 800L,
+    tree_depth = 33L,
+    learn_rate = 0.1,
+#    mtry = tune(),
+    min_n =25L,
+    loss_reduction = 0
+  ) %>% 
+  set_engine(engine = "lightgbm") %>%
+  set_mode(mode = "regression") 
+
+
+(
+  selector_rec <- recipe(
+    cost ~ .,
+    data = raw_df
+  )  %>%
+    step_rm(id) |> 
+    
+    step_ratio(total_children,
+               denom = denom_vars(num_children_at_home)) |>
+    
+    step_ratio(all_numeric_predictors(),
+               denom = denom_vars(store_sqft)) |>
+    
+    step_interact(~ all_numeric_predictors():store_sqft) |> 
+    
+    step_num2factor(
+      coffee_bar,
+      transform = function(x) x + 1,
+      levels = c("0","1")
+    ) |> 
+    step_num2factor(
+      video_store,
+    transform = function(x) x + 1,
+            levels = c("0","1")
+    ) |> 
+    step_num2factor(
+      salad_bar,
+          transform = function(x) x + 1,
+      levels = c("0","1")
+    ) |> 
+    step_num2factor(
+      prepared_food,
+          transform = function(x) x + 1,
+      levels = c("0","1")
+    ) |> 
+    step_num2factor(
+      florist,
+          transform = function(x) x + 1,
+      levels = c("0","1")
+    ) |> 
+    step_num2factor(
+          total_children,
+              transform = function(x) x + 1,
+          levels = c("0","1","2","3","4","5")
+    ) |> 
+    step_num2factor(
+          num_children_at_home,
+              transform = function(x) x + 1,
+          levels = c("0","1","2","3","4","5")
+    ) |> 
+    step_num2factor(
+          recyclable_package,
+              transform = function(x) x + 1,
+          levels = c("0","1")
+    ) |> 
+    step_num2factor(
+          low_fat,
+              transform = function(x) x + 1,
+          levels = c("0","1")
+    ) |> 
+    
+    step_ns(store_sqft, deg_free = 3) |> 
+    step_nzv(all_predictors())
+  
+)
+
+
+train_selector_df <- selector_rec |> prep() |> bake(new_data = NULL)
+
+formulas <- leave_var_out_formulas(cost ~ ., data = train_selector_df)
+
+folds <- vfold_cv(train_selector_df,
+                  v = 5,
+                  strata = cost)
+
+# # consider running parallel again
+
+quality_workflows <-
+  workflow_set(
+    preproc = formulas,
+    models = list(xg = boost_tree_lgbm_spec)
+  )
+
+quality_workflows <- quality_workflows %>%
+  workflow_map("fit_resamples",
+               resamples = folds,
+               metrics = metrics)
+
+rmsle_values <-
+  quality_workflows %>%
+  collect_metrics(summarize = FALSE)  %>%
+  filter(.metric == "rmsle") |>
+  mutate(wflow_id = gsub("_xg", "", wflow_id))
+
+full_model <-
+  rmsle_values %>%
+  filter(wflow_id == "everything") %>%
+  select(full_model = .estimate, id)
+
+differences <-
+  rmsle_values %>%
+  filter(wflow_id != "everything") %>%
+  full_join(full_model, by = "id") %>%
+  mutate(performance_drop = full_model - .estimate)
+
+summary_stats <-
+  differences %>%
+  group_by(wflow_id) %>%
+  summarize(
+    std_err = sd(performance_drop)/sum(!is.na(performance_drop)),
+    performance_drop = mean(performance_drop),
+    lower = performance_drop - qnorm(0.975) * std_err,
+    upper = performance_drop + qnorm(0.975) * std_err,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    wflow_id = factor(wflow_id),
+    wflow_id = reorder(wflow_id, performance_drop)
+  )
+
+summary_stats %>% filter(lower > 0) |> 
+  arrange(desc(lower))
+
+summary_stats |> 
+  filter(upper > 0) |> 
+ggplot(aes(x = performance_drop, y = wflow_id)) +
+  geom_point() +
+  geom_errorbar(aes(xmin = lower, xmax = upper), width = .25) +
+  labs(y = NULL, title = "Leave one out Feature Differences") +
+  theme(plot.title.position = "plot")
+
+ggsave(filename = "xkcd.jpg", path = here::here("data"))
+
+```
+
+
+
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## CV
+
+```{r}
+#| label: make resample folds
+
+set.seed(42)
+
+# split <- rsample::initial_split(raw_df,
+#                                 prop = 0.8)
+
+# test <- testing(split)
+
+folds <- vfold_cv(raw_df,   #training(split), 
+                  v = 10,
+                  strata = cost)
+
+```
+
+## Parallel
+
+Too speed computation, we will load up a parallel backend.
+
+```{r}
+#| label: assign a parallel backend
+
+# all_cores <- parallelly::availableCores(omit = 15)
+# all_cores
+
+# future::plan("multisession", workers = all_cores) doesnt seem to work by itself
+
+# doFuture::registerDoFuture()
+
+# cl <- parallelly::makeClusterPSOCK(all_cores)
+# cl
+
+# future::plan(future::multisession, workers = 12) #cluster
+
+# all_cores <- parallelly::availableCores(omit = 15)
+# 
+# library(doParallel)
+# cl <- makePSOCKcluster(all_cores)
+# registerDoParallel(cl)
+
+```
+
+## Parsnip engines
+
+```{r}
+#| label: model specifications
+
+boost_tree_xgboost_spec <-
+  boost_tree(
+    trees = 600,
+    min_n = 1L,  #26
+    mtry = 35L,     #27
+    tree_depth = 43L,   # 2
+    stop_iter = 25L,
+    learn_rate = 0.3
+  ) %>%
+  set_engine('xgboost',
+             eval_metric = "rmsle",
+             nthread = 16,
+             objective = "reg:squaredlogerror") %>%
+  set_mode('regression')
+
+```
+
+## Preprocessing Recipe
+
+
+```{r}
+#| label: set the recipe
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+(
+  rec <- recipe(
+    cost ~
+      .,
+    data = raw_df
+  )  %>%
+    
+    step_ratio(
+      store_perks,
+      store_sales_in_millions,
+      gross_weight,
+      # avg_cars_at_home_approx_1,
+      store_sales_per_unit,
+      unit_sales_in_millions,
+      # video_store,
+      recyclable_package, #
+      units_per_case,  #
+      coffee_bar, #
+      # salad_bar,
+      # prepared_food,
+      denom = denom_vars(store_sqft)
+    ) |>
+    
+    step_interact(~ store_sqft:store_sales_per_unit) |> 
+    step_interact(~ store_sqft:store_sales_in_millions) |> 
+    step_interact(~ store_sqft:gross_weight) |> # 
+    step_interact(~ store_sqft:coffee_bar) |> 
+    # step_interact(~ store_sqft:total_children) |> 
+    step_interact(~ store_sqft:prepared_food) |> 
+    step_interact(~ store_sqft:florist) |> 
+    step_interact(~ store_sqft:store_perks) |> 
+    step_interact(~ store_sqft:recyclable_package) |> 
+    step_interact(~ store_sqft:salad_bar) |>  #
+    step_interact(~ store_sqft:units_per_case) |> 
+
+    step_num2factor(
+      total_children,
+      transform = function(x)
+        x + 1,
+      levels = c("0", "1", "2", "3", "4", "5")
+    ) |>
+    step_num2factor(
+      num_children_at_home,
+      transform = function(x)
+        x + 1,
+      levels = c("0", "1", "2", "3", "4", "5")
+    ) |>
+    step_dummy(all_nominal_predictors()) |>
+    
+    step_rm(
+      video_store,
+      prepared_food,
+      coffee_bar,
+      recyclable_package,
+      florist,
+      coffee_bar,
+      salad_bar,
+      low_fat,
+      store_sales_in_millions
+    ) |> 
+    
+    step_ns(store_sqft,
+            store_sqft_x_florist,
+            independent_children,
+            deg_free = 3)
+
+)
+
+```
+
+## UMAP View
+
+```{r}
+#| label:  UMAP view
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+# umap_rec <- rec
+# # umap_rec$steps[[15]] <- update(umap_rec$steps[[15]], degree = 2)
+# umap_rec <- umap_rec %>%
+#   embed::step_umap(store_sales_in_millions,
+#                    unit_sales_in_millions,
+#                    salad_bar,
+#                    store_sqft,
+#                    neighbors = 5,
+#                    min_dist = 0.3,
+#                    seed = c(1,42),
+#                    keep_original_cols = FALSE,
+#                    outcome = vars(cost),
+#                    num_comp = 2)
+# 
+# plot_validation_results <- function(recipe, dat = raw_df, target = cost) {
+#   recipe %>%
+#     # Estimate any additional steps
+#     prep() %>%
+#     # Process the data (the validation set by default)
+#     bake(new_data = dat) %>%
+#     # Create the scatterplot matrix
+#     ggplot(aes(x = .panel_x, y = .panel_y, color = {{target}}, fill = {{target}})) +
+#     geom_point(alpha = 0.4, size = 0.5) +
+#     ggforce::geom_autodensity(alpha = .3) +
+#     ggforce::facet_matrix(vars(-{{target}}), layer.diag = 2) +
+#     scale_color_brewer(palette = "Dark2") +
+#     scale_fill_brewer(palette = "Dark2")
+# }
+# 
+# 
+# umap_rec %>%
+#   plot_validation_results() +
+#   ggtitle("UMAP (supervised)")
+
+
+```
+
+## XGBoost
+
+```{r}
+#| label: xgboost
+#| warning: false
+#| fig.height: 10
+#| fig.width: 12
+
+wf <- workflow(rec |> step_dummy(all_nominal_predictors()), boost_tree_xgboost_spec)
+
+# xgboost_param <- wf %>%
+#   extract_parameter_set_dials() %>%
+#   recipes::update(
+#  trees = trees(range = c(400, 4000)),
+#  learn_rate = learn_rate(range = c(-4, -0.2))
+#   ) %>%
+#   dials::finalize(raw_df)
+
+xgboost_burnin <- fit_resamples(
+  wf,
+  resamples = folds,
+  control = control_stack_resamples(),
+  metrics = metrics)
+
+collect_metrics(xgboost_burnin) |>
+  arrange(mean)
+
+# autoplot(xgboost_burnin)
+# 
+# final_params <-
+#   xgboost_burnin %>%
+#   select_best(metric = "rmsle")
+# 
+# final_rs <-
+#   wf %>%
+#   finalize_workflow(final_params) %>%
+#   last_fit(split, metrics = metrics)
+# 
+# collect_metrics(final_rs)
+# 
+# final_rs |>
+#   extract_fit_engine() |>
+#   vip::vip(num_features = 50)
+
+
+```
+
+
+## Earth
+
+```{r}
+
+mars_earth_spec <-
+  mars(prod_degree = 1L) %>%
+  set_engine('earth') %>%
+  set_mode('regression')
+
+wf <- workflow(rec |> step_dummy(all_nominal_predictors()), mars_earth_spec)
+
+# earth_param <- wf %>%
+#   extract_parameter_set_dials() %>%
+#   recipes::update(
+#     prod_degree = prod_degree(range = c(1,3))
+#   ) %>%
+#   dials::finalize(raw_df)
+
+earth_burnin <- fit_resamples(
+  wf,
+  resamples = folds,
+  control = ctrl,
+  metrics = metrics)
+
+collect_metrics(earth_burnin) |>
+  arrange(mean)
+
+# autoplot(earth_burnin)
+# 
+# earth_final_params <-
+#   earth_burnin %>%
+#   select_best(metric = "rmsle")
+# 
+# earth_fit <-
+#   wf %>%
+#   finalize_workflow(earth_final_params) %>%
+#   last_fit(split, metrics = metrics)
+# 
+# collect_metrics(earth_fit)
+# 
+# earth_fit |> 
+#   extract_fit_engine() |> 
+#   vip::vip(num_features = 10)
+
+```
+
+
+```{r}
+#| label: bonsai
+#| warning: false
+#| fig.height: 10
+#| fig.width: 12
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 800L,
+    tree_depth = tune(),
+    learn_rate = .05,
+#    mtry = tune(),
+    min_n =tune(),
+    loss_reduction = tune()
+  ) %>% 
+  set_engine(engine = "lightgbm") %>%
+  set_mode(mode = "regression") 
+
+wf <- workflow(rec, boost_tree_lgbm_spec)
+
+lgbm_param <- wf %>%
+   extract_parameter_set_dials() %>%
+   recipes::update(
+     tree_depth = tree_depth(range = c(20, 40)),
+    # mtry = mtry(range = c(30,60)),
+      min_n = min_n(range = c(24, 40))
+   ) %>%
+   dials::finalize(raw_df)
+
+lgbm_burnin <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = 36,
+  control = control_stack_resamples(),
+  metrics = metrics,
+  param_info = lgbm_param)
+
+collect_metrics(lgbm_burnin) |>
+  arrange(mean)
+
+autoplot(lgbm_burnin)
+
+regression_fit <- wf |>
+  finalize_workflow(select_best(lgbm_burnin)) |>
+  fit(raw_df)
+
+```
+
+
+
+
+```{r}
+#| label: classifier
+
+class_df <- raw_df |> 
+  mutate(cost = factor(cost)) |> 
+  bind_cols(predict(regression_fit, raw_df)) |> 
+  mutate(regression = .pred)
+
+logistic_reg_glm_spec <-
+  parsnip::multinom_reg(penalty = 0.1) %>%
+  set_engine('glmnet')
+
+(
+  rec <- recipe(
+    cost ~
+      .,
+    data = class_df
+  )  %>%
+    
+    step_ratio(
+      store_perks,
+      store_sales_in_millions,
+      gross_weight,
+      # avg_cars_at_home_approx_1,
+      store_sales_per_unit,
+      unit_sales_in_millions,
+      # video_store,
+      recyclable_package, #
+      units_per_case,  #
+      coffee_bar, #
+      # salad_bar,
+      # prepared_food,
+      denom = denom_vars(store_sqft)
+    ) |>
+    
+    step_interact(~ store_sqft:store_sales_per_unit) |> 
+    step_interact(~ store_sqft:store_sales_in_millions) |> 
+    step_interact(~ store_sqft:gross_weight) |> # 
+    step_interact(~ store_sqft:coffee_bar) |> 
+    # step_interact(~ store_sqft:total_children) |> 
+    step_interact(~ store_sqft:prepared_food) |> 
+    step_interact(~ store_sqft:florist) |> 
+    step_interact(~ store_sqft:store_perks) |> 
+    step_interact(~ store_sqft:recyclable_package) |> 
+    step_interact(~ store_sqft:salad_bar) |>  #
+    step_interact(~ store_sqft:units_per_case) |> 
+
+    step_num2factor(
+      total_children,
+      transform = function(x)
+        x + 1,
+      levels = c("0", "1", "2", "3", "4", "5")
+    ) |>
+    step_num2factor(
+      num_children_at_home,
+      transform = function(x)
+        x + 1,
+      levels = c("0", "1", "2", "3", "4", "5")
+    ) |>
+    step_dummy(all_nominal_predictors()) |>
+    
+    step_rm(
+      video_store,
+      prepared_food,
+      coffee_bar,
+      recyclable_package,
+      florist,
+      coffee_bar,
+      salad_bar,
+      low_fat,
+      store_sales_in_millions
+    ) |> 
+    
+    step_ns(store_sqft,
+            store_sqft_x_florist,
+            independent_children,
+            deg_free = 3)
+
+)
+
+
+wf <- workflow(rec |> step_dummy(all_nominal_predictors()) |> step_normalize(all_predictors()), logistic_reg_glm_spec)
+
+folds <- vfold_cv(class_df,   #training(split), 
+                  v = 10)
+
+glmnet_class<- fit_resamples(
+  wf,
+  resamples = folds,
+  control = control_stack_resamples(),
+  metrics = metric_set(yardstick::roc_auc))
+
+collect_metrics(glmnet_class) |>
+  arrange(mean)
+
+classification_fit <- wf |>
+  finalize_workflow(select_best(glmnet_class)) |>
+  fit(class_df)
+
+predict
+
+```
+
+
+## Stacks
+
+```{r}
+
+
+cost_stack <- stacks() |> 
+  add_candidates(xgboost_burnin) |> 
+  add_candidates(earth_burnin) |> 
+  add_candidates(lgbm_burnin) 
+
+cost_stack 
+
+cost_model <- cost_stack |> 
+  blend_predictions(
+    metric = metrics,
+    penalty = c(seq(0.015, 0.045, 0.01)),
+    mixture = c(seq(0, 0.5, 0.1)),
+    non_negative = FALSE,
+    control = tune::control_grid(allow_par = TRUE)
+  )
+
+autoplot(cost_model)
+
+autoplot(cost_model, type = "members")
+
+autoplot(cost_model, type = "weights")
+
+cost_fit <- cost_model |> 
+  fit_members()
+
+# test_preds <- test %>%
+#   bind_cols(predict(cost_fit, .))
+# 
+# ggplot(test_preds) +
+#   aes(x = cost, 
+#       y = .pred) +
+#   geom_point() + 
+#   coord_obs_pred()
+# 
+# test_preds |> 
+#   rmsle(cost, .pred)
+
+submission_df <- 
+  bind_cols(competition_df, predict(cost_fit, competition_df)) |> 
+  dplyr::select(id, cost = .pred)
+
+```
+
+
+
+```{r}
+
+# ctrlg <- finetune::control_sim_anneal(
+#      verbose = FALSE,
+#      verbose_iter = TRUE,
+#      save_pred = FALSE,
+#      save_workflow = FALSE,
+#      parallel_over = "everything")
+# 
+# results <- finetune::tune_sim_anneal(
+#   wf,
+#   resamples = folds,
+#   iter = 100,
+#   initial = xgboost_burnin,
+#   control = ctrlg,
+#   metrics = metrics,
+#   param_info = xgboost_param
+#   )
+# 
+# autoplot(results) 
+# 
+# collect_metrics(results, metric = "rmsle") %>% 
+#   select(-.metric, -.estimator) %>%
+#   arrange(mean)
+# 
+# final_params <-
+#   results %>%
+#   select_best(metric = "rmsle")
+# 
+# final_params
+# 
+# final_rs <-
+#   wf %>%
+#   finalize_workflow(final_params) %>%
+#   last_fit(split, metrics = metrics)
+# 
+# collect_metrics(final_rs)
+# 
+# final_rs |> 
+#   extract_fit_engine() |> 
+#   vip::vip(num_features = 20)
+# 
+# final_fitted <- extract_workflow(final_rs)
+# 
+# submission_df <- augment(final_fitted, competition_df) |> 
+#   select(id, cost = .pred)
+
+
+```
+
+
+# Submission
+
+
+```{r}
+
+submission_df |> 
+  ggplot(aes(cost)) +
+  geom_histogram()
+
+submission_df %>%
+  write_csv(str_c(path, "submission.csv"))
+```
+
+
+
+

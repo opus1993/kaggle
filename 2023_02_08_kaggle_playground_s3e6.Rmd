@@ -1,0 +1,453 @@
+---
+title: "Paris home values Season3 Episode6"
+output: html_document
+date: "2023-02-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+library(tidyverse) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+library(bonsai)
+library(corrr)
+library(stacks)  # a custom ensembling tool
+})
+    
+tidymodels_prefer()
+conflicted::conflicts_prefer(recipes::update)
+
+theme_set(theme_bw())
+
+metrics <- metric_set(rmse)
+
+```
+
+
+```{r }
+#| label: load data
+
+
+isFactor <-c("has_yard","has_pool","is_new_built","has_storm_protector","has_storage_room","has_guest_room","city_code")
+
+preprocessor <- function(data){
+  data |> 
+    janitor::clean_names() %>% 
+    mutate(across(all_of(isFactor), factor)) %>% 
+    filter(id != 15334) %>% # square meters outlier
+    filter(id != 5659) %>% # floor outlier  
+    filter(made < 2025) %>% 
+    filter(garage < 1001)
+}
+
+raw_df <- read_csv(here::here("data","train.csv"),
+                   show_col_types = FALSE) |> 
+          preprocessor() |> 
+          distinct(across(-id), .keep_all = TRUE) 
+
+competition_df <- read_csv(here::here("data","test.csv"),
+                   show_col_types = FALSE) |> 
+          preprocessor()
+
+all_df <- bind_rows(
+  raw_df |> mutate(source = "train"),
+  competition_df |> mutate(source = "competition")
+) |> mutate(source = factor(source))
+
+```
+
+Is this competition transaction already in the training data with a correct label?
+
+```{r}
+
+all_df |> 
+  group_by(-id) |>  
+  mutate(num_dups = n(), 
+         dup_id = row_number()) |>  
+  ungroup() |> 
+  group_by(source) |> 
+  mutate(is_duplicated = dup_id > 1) |> 
+  count(is_duplicated)
+
+```
+
+This dataset appears to lack any duplicates.
+
+
+```{r}
+
+raw_df |> 
+  keep(is.numeric) %>% 
+  pivot_longer(
+    -c(id),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(value, fill = metric, color = NULL)) +
+  geom_histogram(alpha = 0.6, bins = 30, show.legend = FALSE) +
+  scale_fill_brewer(palette = "RdYlBu") +
+  scale_x_continuous(n.breaks = 3) +
+  facet_wrap(vars(metric), scales = "free") +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+
+```
+
+
+
+```{r}
+#| label: make resample folds
+
+set.seed(42)
+
+train_df <- recipe(quality ~ ., data = raw_df) %>% 
+  themis::step_adasyn(quality, over_ratio = 0.11)  %>%
+  prep()  %>% 
+  bake(new_data = NULL)
+
+suppressWarnings(
+folds <- vfold_cv(train_df, 
+                  v = 10,
+                  repeats = 10,
+                  strata = quality)
+)
+
+```
+
+Too speed computation, we will load up a parallel backend.
+
+```{r}
+#| label: assign a parallel backend
+
+all_cores <- parallelly::availableCores(omit = 1)
+all_cores
+
+future::plan("multisession", workers = all_cores) 
+```
+
+
+```{r}
+#| label: model specifications
+
+boost_tree_xgboost_spec <-
+  boost_tree(
+    trees = 200L,
+    min_n = tune(),# 7, # 7L, 
+    mtry = 13, # 11L, 
+    tree_depth = 7,# 10L,  
+    learn_rate = 0.1, 
+    loss_reduction = 0,
+    stop_iter = 16L
+  ) |> 
+  set_engine('xgboost') |> 
+  set_mode('classification')
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 200L,
+    tree_depth = 11, # 11L,
+    learn_rate = 0.1,
+    mtry = 17, # 14L,
+    min_n = tune(),# 16, # 14L,
+    loss_reduction = 0
+  ) %>% 
+  set_engine(engine = "lightgbm") %>%
+  set_mode(mode = "classification") 
+
+rand_forest_ranger_spec <-
+  rand_forest(mtry = 3, 
+              min_n = tune() #24
+              ) %>%
+  set_engine('ranger') %>%
+  set_mode('classification')
+
+rand_forest_randomForest_spec <-
+  rand_forest(mtry = 3, 
+              min_n = tune() #24
+              ) %>%
+  set_engine('randomForest') %>%
+  set_mode('classification')
+
+multinom_reg_glmnet_spec <-
+  multinom_reg(penalty = tune(), 
+               mixture = 1.0) %>%
+  set_engine('glmnet')
+
+rec <- recipe(quality ~ .,
+         data = train_df ) |>
+  update_role(id, new_role = "id") |>
+  themis::step_adasyn(quality) |> 
+  step_mutate(total_acidity = fixed_acidity + volatile_acidity + citric_acid) %>% 
+  step_ratio(
+    total_acidity, sulphates,
+    denom = denom_vars(density)
+  ) %>% 
+  step_ratio(
+    density,
+    denom = denom_vars(alcohol)
+  ) %>% 
+  step_ratio(
+    sulphates,
+    denom = denom_vars(chlorides)
+  ) %>% 
+  step_ratio(
+    sulphates,
+    denom = denom_vars(volatile_acidity)
+  ) %>% 
+  step_interact(~ residual_sugar:density_o_alcohol) %>%
+  step_interact(~ sulphates:alcohol) %>%
+  step_interact(~ density_o_alcohol:sulphates_o_volatile_acidity) %>%
+  step_interact(~ fixed_acidity:free_sulfur_dioxide)   %>%
+  step_interact(~ density_o_alcohol:sulphates_o_chlorides) %>% 
+  step_YeoJohnson(all_numeric_predictors()) 
+
+rec |> prep() |> bake(new_data = NULL) |> 
+    pivot_longer(
+    -c(id,quality),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  ggplot(aes(value, fill = quality, color = NULL)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_brewer(palette = "RdYlBu") +
+  facet_wrap(vars(metric), scales = "free") +
+  theme_dark() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+
+rec |> prep() |> bake(new_data = NULL) |> 
+  correlate(quiet = TRUE) %>%
+  rearrange() %>% 
+  shave() %>% 
+  rplot() +
+  scale_x_discrete(guide = guide_axis(n.dodge = 3))
+
+
+
+```
+
+```{r}
+xgboost_param <- boost_tree_xgboost_spec |>
+  extract_parameter_set_dials() |>
+  update(
+    min_n = min_n(range = c(6L, 10L))
+    # mtry = mtry(range = c(9L, 17L)),
+    # tree_depth = tree_depth(range = c(6L, 12L)),
+    # stop_iter = stop_iter(range = c(10,18))
+  ) |>
+  finalize(rec |> prep() |> bake(new_data = NULL))
+
+lgbm_param <- boost_tree_lgbm_spec |>
+  extract_parameter_set_dials() |>
+  update(
+    min_n = min_n(range = c(12L, 19L))
+    # mtry = mtry(range = c(14L, 17L)),
+    # tree_depth = tree_depth(range = c(10L, 14L)),
+  ) |>
+  finalize(rec |> prep() |> bake(new_data = NULL))
+
+rand_forest_ranger_param <- rand_forest_ranger_spec %>% 
+  extract_parameter_set_dials() |>
+  update(
+    min_n = min_n(range = c(16L, 24L))
+  ) |>
+  finalize(rec |> prep() |> bake(new_data = NULL))
+
+rand_forest_random_forest_param <- rand_forest_randomForest_spec %>% 
+  extract_parameter_set_dials() |>
+  update(
+    min_n = min_n(range = c(15L, 22L))
+  ) |>
+  finalize(rec |> prep() |> bake(new_data = NULL))
+
+
+multinom_reg_glmnet_param <- multinom_reg_glmnet_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    penalty = penalty(range = c(-6,-3)) |>
+  finalize(rec |> prep() |> bake(new_data = NULL))
+  )
+
+```
+
+
+
+```{r}
+ctrl <- control_grid(
+     verbose = FALSE,
+     save_pred = TRUE,
+     save_workflow = TRUE,
+     parallel_over = "everything")
+
+results <- tune_grid(
+  workflow(rec, boost_tree_xgboost_spec),
+  resamples = folds,
+  grid = 5,
+  control = ctrl,
+  metrics = metrics,
+  param_info = xgboost_param
+)
+  
+results |> 
+  collect_metrics(summarize = TRUE) |> 
+    filter(.metric == "kap") |> 
+  arrange(desc(mean))
+```
+
+
+
+```{r}
+results2 <- tune_grid(
+  workflow(rec, boost_tree_lgbm_spec),
+  resamples = folds,
+  grid = 5,
+  control = ctrl,
+  param_info = lgbm_param,
+  metrics = metrics
+)
+  
+results2 |> 
+  collect_metrics(summarize = TRUE) |> 
+    filter(.metric == "kap") |> 
+  arrange(desc(mean))
+```
+
+```{r}
+results3 <- tune_grid(
+  workflow(rec, rand_forest_ranger_spec),
+  resamples = folds,
+  control = ctrl,
+  grid = 5,
+  metrics = metrics,
+  param_info = rand_forest_ranger_param
+)
+
+results3 %>% 
+  collect_metrics(summarize = TRUE) %>%
+    filter(.metric == "kap") %>% 
+  arrange(desc(mean))
+```
+
+```{r}
+results4 <- tune_grid(
+  workflow(rec, rand_forest_randomForest_spec),
+  resamples = folds,
+  control = ctrl,
+  grid = 5,
+  metrics = metrics,
+  param_info = rand_forest_random_forest_param
+)
+
+results4 %>% 
+  collect_metrics(summarize = TRUE) %>%
+    filter(.metric == "kap") %>% 
+  arrange(desc(mean))
+
+
+
+```
+
+
+```{r}
+results5 <- tune_grid(
+  workflow(rec %>% 
+             step_poly(all_numeric_predictors()) %>% 
+             step_normalize(all_numeric_predictors()) , 
+           multinom_reg_glmnet_spec),
+  resamples = folds,
+  control = ctrl,
+  grid = 5,
+  metrics = metrics,
+  param_info = multinom_reg_glmnet_param
+)
+
+results5 %>% 
+  collect_metrics(summarize = TRUE) %>%
+    filter(.metric == "kap") %>% 
+  arrange(desc(mean))
+
+
+
+```
+
+
+```{r}
+workflow(rec, boost_tree_xgboost_spec) %>%
+   fit(raw_df) %>%
+   extract_fit_parsnip() %>%
+   vip::vip(num_features = 20) +
+  labs(title = "XGBboost Variable Importance")
+
+workflow(rec, rand_forest_randomForest_spec) %>%
+  finalize_workflow(select_best(results4)) %>% 
+   fit(raw_df) %>%
+   extract_fit_parsnip() %>%
+   vip::vip(num_features = 20) +
+  labs(title = "Random Forest Variable Importance")
+  
+
+
+
+```
+
+
+
+```{r}
+
+ens <- stacks() |>
+  stacks::add_candidates(results) |>
+  stacks::add_candidates(results2) |>
+  stacks::add_candidates(results3) |>
+  stacks::add_candidates(results4) %>% 
+  stacks::add_candidates(results5) %>%
+  stacks::blend_predictions(
+    metric = metric_set(kap_quadratic),
+    penalty = c(seq(0.005, 0.25, 0.025)),
+    mixture = c(seq(0, 0.25, 0.05,)),
+    non_negative = FALSE,
+    control = tune::control_grid(allow_par = TRUE,
+                                 event_level = "second")
+  ) 
+
+autoplot(ens)
+
+autoplot(ens, "weights")
+
+ensemble <- fit_members(ens)
+
+```
+
+
+```{r}
+
+predict(ensemble, raw_df, type = "class") |> 
+  bind_cols(raw_df) |> 
+  conf_mat(quality, .pred_class) |> 
+  autoplot("heatmap") +
+  labs(title = "Training Data Ensemble")
+
+predict(ensemble, raw_df, type = "class") |> 
+  bind_cols(raw_df) |> 
+  kap_quadratic(quality, .pred_class)
+
+```
+
+
+```{r}
+submission_df <- predict(ensemble, 
+        competition_df, 
+        type = "class") %>%
+  bind_cols(competition_df) %>% 
+  select(id, quality = .pred_class)
+
+submission_df |> 
+  count(quality)
+
+submission_df %>%
+  write_csv(here::here("data", "submission.csv"))
+```
+
+
+
+

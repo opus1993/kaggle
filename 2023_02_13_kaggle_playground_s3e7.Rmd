@@ -1,0 +1,658 @@
+---
+title: "Reservation Cancellation Episode7"
+output: html_document
+date: "2023-01-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+library(tidyverse) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+library(bonsai)
+library(discrim)
+library(corrr)
+library(GGally)
+library(stacks)  # a custom ensembling tool
+})
+    
+tidymodels_prefer()
+conflicted::conflicts_prefer(recipes::update)
+
+theme_set(theme_bw())
+
+metrics <- metric_set(roc_auc)
+
+```
+
+
+```{r}
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s3e7/"
+} else {
+  path <- str_c(here::here("data"),"/")
+}
+```
+
+
+```{r }
+#| label: load data
+
+factors <- c("room_type_reserved", "required_car_parking_space", "type_of_meal_plan", "market_segment_type", "repeated_guest")
+
+preprocessor <- function(data){
+  data |> 
+    janitor::clean_names() |> 
+    mutate(arrival_date = 
+      case_when(arrival_month == 2 & arrival_date %in% c(29,30,31) ~ 28,
+                arrival_month %in% c(2,4,6,9, 11) & arrival_date == 31 ~ 30,
+                .default = arrival_date
+                  ),
+    no_of_adults = if_else(no_of_adults == 0, 1, no_of_adults),
+    no_of_weekend_nights = if_else(no_of_weekend_nights > 2, 2, no_of_weekend_nights),
+    arrival = lubridate::ymd(paste0(arrival_year,"-",arrival_month,"-",arrival_date)),
+    booking = arrival - lubridate::days(lead_time),
+    across(all_of(factors), factor)
+    ) |> 
+    select(- arrival_date, 
+           - arrival_month, 
+           - arrival_year)
+}
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) |> 
+          preprocessor() |> 
+          distinct(across(-id), .keep_all = TRUE) |> 
+          mutate(booking_status = factor(booking_status,
+                                         labels = c("stayed","cancelled")))
+
+competition_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE) |> 
+          preprocessor()
+
+all_df <- bind_rows(
+  raw_df |> mutate(source = "train"),
+  competition_df |> mutate(source = "competition")
+) |> mutate(source = factor(source))
+
+```
+
+Booking_ID: unique identifier of each booking
+
+No of adults: Number of adults
+No of children: Number of Children
+noofweekend_nights: Number of weekend nights (Saturday or Sunday) the guest stayed or booked to stay at the hotel
+noofweek_nights: Number of week nights (Monday to Friday) the guest stayed or booked to stay at the hotel
+typeofmeal_plan: Type of meal plan booked by the customer
+requiredcarparking_space: Does the customer require a car parking space? (0 - No, 1- Yes)
+roomtypereserved: Type of room reserved by the customer. The values are ciphered (encoded) by INN Hotels.
+lead_time: Number of days between the date of booking and the arrival date
+arrival_year: Year of arrival date
+arrival_month: Month of arrival date
+arrival_date: Date of the month
+Market segment type: Market segment designation.
+repeated_guest: Is the customer a repeated guest? (0 - No, 1- Yes)
+noofprevious_cancellations: Number of previous bookings that were canceled by the customer prior to the current booking
+noofpreviousbookingsnot_canceled: Number of previous bookings not canceled by the customer prior to the current booking
+avgpriceper_room: Average price per day of the reservation; prices of the rooms are dynamic. (in euros)
+noofspecial_requests: Total number of special requests made by the customer (e.g. high floor, view from the room, etc)
+booking_status: Flag indicating if the booking was canceled or not.
+
+
+Is this competition transaction already in the training data with a correct label?
+
+```{r}
+
+all_df |> 
+  group_by(-id) |>  
+  mutate(num_dups = n(), 
+         dup_id = row_number()) |>  
+  ungroup() |> 
+  group_by(source, booking_status) |> 
+  mutate(is_duplicated = dup_id > 1) |> 
+  count(is_duplicated)
+
+```
+
+This dataset appears to lack any duplicates, after applying the pre-processor.
+
+Lets zoom in more closely on the training set only.
+
+
+```{r}
+#| label: numeric density plots
+
+raw_df |> 
+  select(where(is.numeric), booking_status) |> 
+  pivot_longer(- c(id, booking_status),
+    names_to = "metric",
+    values_to = "value"
+  ) |> 
+  filter(value > 0.1) |> 
+  ggplot(aes(value, fill = factor(booking_status), color = NULL)) +
+  geom_density(alpha = 0.6, show.legend = FALSE) +
+  scale_fill_brewer(palette = "RdYlBu") +
+  facet_wrap(vars(metric, booking_status), scales = "free", ncol = 3) +
+  theme_dark() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+
+
+raw_df %>% 
+  drop_na() %>% 
+  select(all_of(factors), booking_status) %>% 
+  pivot_longer(c(-booking_status), names_to = "type", values_to = "value") %>% 
+  ggplot(aes(value, fill = booking_status)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ type, scales = "free", nrow = 2) +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  labs(title = "Target impact - categorical features - step 1")
+
+raw_df %>% 
+  drop_na() %>% 
+  select(all_of(factors), booking_status) %>% 
+  pivot_longer(c(-booking_status), names_to = "type", values_to = "value") %>% 
+  group_by(type, value, booking_status) %>% 
+  summarize(n = n(),
+            .groups = "drop") |> 
+  mutate(frac = n / sum(n)) |> 
+  filter(booking_status != FALSE) %>% 
+  ggplot(aes(value, frac, fill = type)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~ type, scales = "free_x") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  labs(title = "Target impact - categorical features - step 2: percentages of popular songs")
+
+# a function to extract binomial confidence levels, by kaggle user headsortails
+get_binCI <- function(x,n){
+  test_result <- binom.test(x,n)
+  test_result_ci <- test_result$conf.int
+  test_result_ci <- setNames(test_result_ci, c("lwr", "upr"))
+  return(as.list(test_result_ci))
+}
+
+raw_df %>% 
+  drop_na() %>% 
+  select(all_of(factors), booking_status) %>% 
+  pivot_longer(c(-booking_status), names_to = "type", values_to = "value") %>% 
+  count(type, value, booking_status) %>% 
+  pivot_wider(names_from = booking_status, values_from = n) %>%
+  group_by(type, value) %>% 
+  mutate(frac = stayed/(stayed + cancelled)*100,
+         lwr = get_binCI(stayed,(stayed + cancelled))[[1]]*100,
+         upr = get_binCI(stayed,(stayed + cancelled))[[2]]*100
+         ) %>%
+  ggplot(aes(value, frac, col = type)) +
+  geom_point(size = 4, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), show.legend = FALSE) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(title = "Target impact - categorical features - step 3: points with uncertainties")
+
+
+```
+
+
+
+```{r }
+#| label: feature target interaction
+#| fig.height: 4.5
+raw_df %>% 
+  drop_na() %>% 
+  group_by(room_type_reserved, required_car_parking_space, booking_status) %>% 
+  summarise(avg_price_per_room = median(avg_price_per_room, na.rm = TRUE)) %>% 
+  ggplot(aes(room_type_reserved, required_car_parking_space, fill = avg_price_per_room)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  facet_wrap(~ booking_status, nrow = 2) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+
+```{r }
+#| label: feature target interaction
+#| fig.height: 4.5
+raw_df %>% 
+  drop_na() %>% 
+  group_by(market_segment_type, repeated_guest, booking_status) %>% 
+  summarise(avg_price_per_room = median(avg_price_per_room, na.rm = TRUE)) %>% 
+  ggplot(aes(market_segment_type, repeated_guest, fill = avg_price_per_room)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  facet_wrap(~ booking_status, nrow = 2) +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+
+```{r }
+#| label: feature target interaction4
+#| fig.height: 4.5
+
+plot_interaction <- function(data, var1, var2){
+
+data %>% 
+  drop_na() %>% 
+  group_by({{var1}} := ggplot2::cut_number({{var1}}, 5), {{var2}} := ggplot2::cut_number({{var2}}, 5), booking_status) %>% 
+  summarise(avg_price_per_room = median(avg_price_per_room, na.rm = TRUE),
+            .groups = "drop") %>% 
+  ggplot(aes({{var1}}, {{var2}}, fill = avg_price_per_room)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  facet_wrap(~ booking_status, nrow = 2) +
+  theme_minimal() +
+  theme(legend.position = "right")
+  
+}
+
+raw_df |> 
+  transmute(arrival_week = lubridate::week(arrival),
+         booking_week = lubridate::week(booking),
+         avg_price_per_room, booking_status) %>%  
+   plot_interaction(arrival_week, booking_week)
+
+```
+
+```{r }
+#| label: feature target interaction5
+#| fig.height: 4.5
+
+raw_df |> 
+  transmute(lead_time,
+         booking_week = lubridate::week(booking),
+         avg_price_per_room, booking_status) %>%  
+   plot_interaction(lead_time, booking_week)
+
+```
+
+```{r}
+#| label: interesting feature interactions
+#| warning: false
+#| message: false
+#| fig.height: 10
+#| fig.width: 12
+
+foo <- raw_df %>% 
+  select(where(is.numeric), -id, booking_status) %>% 
+  drop_na() 
+
+foo %>% 
+  ggpairs(
+    columns = 1:(ncol(foo)-1),
+    mapping = aes(color = booking_status, alpha = 0.5),
+    lower = list(continuous = wrap("points", alpha = 0.3, size=0.01)),
+    upper = list(continuous = wrap("smooth", alpha = 0.005, size = 0.1)),
+    progress = FALSE) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank()) +
+  labs(title = "Pair plots: lower: scatter; upper: linear fit - color by target")
+```
+
+
+```{r}
+#| label: make resample folds
+
+set.seed(42)
+
+folds <- vfold_cv(raw_df, 
+                  v = 11,
+                  repeats = 2,
+                  strata = booking_status)
+
+```
+
+Too speed computation, we will load up a parallel backend.
+
+```{r}
+#| label: assign a parallel backend
+
+all_cores <- parallelly::availableCores(omit = 1)
+all_cores
+
+future::plan("multisession", workers = all_cores) 
+```
+
+
+```{r}
+#| label: model specifications
+
+boost_tree_xgboost_spec <-
+  boost_tree(
+    trees = 200L,
+    min_n = 7L, # 7, # 7L, 
+    mtry = 23L, # 11L, 
+    tree_depth = 8L# 10L,  
+    # learn_rate = 0.1, 
+    # loss_reduction = 0,
+    # stop_iter = 16L
+  ) |> 
+  set_engine('xgboost') |> 
+  set_mode('classification')
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 200L,
+    tree_depth = 13,
+    learn_rate = 0.03,
+    mtry = 23, 
+    min_n = 40
+    # loss_reduction = 0
+  ) %>% 
+  set_engine(engine = "lightgbm") %>%
+  set_mode(mode = "classification") 
+
+rand_forest_ranger_spec <-
+  rand_forest(
+    mtry = 13L, 
+    min_n = 46L
+              ) %>%
+  set_engine('ranger', importance = "impurity") %>%
+  set_mode('classification')
+
+rand_forest_randomForest_spec <-
+  rand_forest(
+    mtry = 13L, 
+    min_n = 46L) %>%
+  set_engine('randomForest') %>%
+  set_mode('classification')
+
+multinom_reg_glmnet_spec <-
+  logistic_reg(
+    penalty = 1e-3, 
+    mixture = 1.0
+    ) %>%
+  set_engine('glmnet')
+
+discrim_flexible_earth_spec <-
+  discrim_flexible(
+    num_terms = 37,
+    prod_degree = 2
+  ) %>%
+  set_engine('earth')
+
+rec <- recipe(booking_status ~ .,
+         data = raw_df ) |>
+  update_role(id, new_role = "id") |>
+  step_rm(starts_with("no_of_previous")) |> 
+#  step_log(starts_with("no_of_previous"),
+#           offset = 0.1) |> 
+  step_date(arrival, booking,
+            features = c("dow", "week","month", "quarter"),
+            keep_original_cols = FALSE) |> 
+  step_interact(~ arrival_week:booking_week) |> 
+  step_interact(~ lead_time:booking_week) |> 
+#  step_interact(~ lead_time:no_of_special_requests) |> 
+  step_interact(~ no_of_special_requests:arrival_quarter) |> 
+#  step_interact(~ lead_time:no_of_previous_cancellations ) |> 
+#  step_interact(~ lead_time:no_of_weekend_nights ) |> 
+#  step_interact(~ no_of_previous_cancellations:no_of_adults) |> 
+#  step_interact(~ booking_week:no_of_weekend_nights) |> 
+#  step_interact(~ avg_price_per_room:no_of_weekend_nights) |> 
+  step_poly(lead_time) |> 
+  step_nzv(all_numeric_predictors()) 
+
+
+```
+
+
+```{r}
+# xgboost_param <- boost_tree_xgboost_spec |>
+#   extract_parameter_set_dials() |>
+#   update(
+#     # min_n = min_n(range = c(3L, 16L)),
+#     # mtry = mtry(range = c(15L, 30L)) 
+#     tree_depth = tree_depth(range = c(6L, 12L))
+#     # stop_iter = stop_iter(range = c(10,18))
+#   ) |>
+#   finalize(rec |> prep() |> bake(new_data = NULL))
+# 
+# lgbm_param <- boost_tree_lgbm_spec |>
+#   extract_parameter_set_dials() |>
+#   update(
+#     min_n = min_n(range = c(3L, 19L)),
+#      mtry = mtry(range = c(14L, 24L))
+#     # tree_depth = tree_depth(range = c(10L, 14L)),
+#   ) |>
+#   finalize(rec |> prep() |> bake(new_data = NULL))
+# 
+# rand_forest_ranger_param <- rand_forest_ranger_spec %>% 
+#   extract_parameter_set_dials() |>
+#   update(
+#     mtry = mtry()
+# #    min_n = min_n(range = c(35L, 70L))
+#   ) |>
+#   finalize(rec |> prep() |> bake(new_data = NULL))
+# 
+# rand_forest_random_forest_param <- rand_forest_randomForest_spec %>% 
+#   extract_parameter_set_dials() |>
+#   update(
+#     min_n = min_n(range = c(6L, 22L))
+#   ) |>
+#   finalize(rec |> prep() |> bake(new_data = NULL))
+# 
+# 
+# multinom_reg_glmnet_param <- multinom_reg_glmnet_spec %>% 
+#   extract_parameter_set_dials() %>% 
+#   update(
+#     penalty = penalty(range = c(-6,-3)) |>
+#   finalize(rec |> prep() |> bake(new_data = NULL))
+#   )
+
+```
+
+
+
+```{r}
+#| label: xgb
+ctrl <- control_resamples(
+     verbose = FALSE,
+     save_pred = TRUE,
+     save_workflow = TRUE,
+     parallel_over = "everything")
+
+results <- fit_resamples(
+  workflow(rec |> step_dummy(all_nominal_predictors()), boost_tree_xgboost_spec),
+  resamples = folds,
+  #  grid = 15,
+  control = ctrl,
+  metrics = metrics,
+  #  param_info = xgboost_param
+)
+
+results |> 
+  collect_metrics(summarize = TRUE) |> 
+  arrange(desc(mean))
+
+workflow(rec |> step_dummy(all_nominal_predictors()), boost_tree_xgboost_spec) %>%
+#  finalize_workflow(select_best(results)) %>% 
+   fit(raw_df) %>%
+   extract_fit_parsnip() %>%
+   vip::vip(num_features = 20) +
+  labs(title = "XGBoost Variable Importance")
+```
+
+
+
+```{r}
+#| label: lgbm
+results2 <- fit_resamples(
+  workflow(rec, boost_tree_lgbm_spec),
+  resamples = folds,
+  control = ctrl,
+  metrics = metrics
+)
+
+results2 |> 
+  collect_metrics(summarize = TRUE) |> 
+  arrange(desc(mean))
+
+workflow(rec, boost_tree_lgbm_spec) %>%
+fit(raw_df) %>%
+  extract_fit_engine() %>%
+   lgb.importance(percentage = TRUE) %>%
+   lgb.plot.importance(top_n = 20) 
+```
+
+```{r}
+#| label: ranger
+results3 <- fit_resamples(
+  workflow(rec, rand_forest_ranger_spec),
+  resamples = folds,
+  control = ctrl,
+  metrics = metrics
+)
+
+
+results3 %>% 
+  collect_metrics(summarize = TRUE) %>%
+  arrange(desc(mean))
+
+workflow(rec, rand_forest_ranger_spec) %>%
+   fit(raw_df) %>%
+   extract_fit_parsnip() %>%
+   vip::vip(num_features = 20) +
+  labs(title = "Ranger Variable Importance")
+```
+
+```{r}
+#| label: randomForest
+results4 <- fit_resamples(
+  workflow(rec, rand_forest_randomForest_spec),
+  resamples = folds,
+  control = ctrl,
+  metrics = metrics
+)
+
+results4 %>% 
+  collect_metrics(summarize = TRUE) %>%
+  arrange(desc(mean))
+
+workflow(rec, rand_forest_randomForest_spec) %>%
+   fit(raw_df) %>%
+   extract_fit_parsnip() %>%
+   vip::vip(num_features = 20) +
+  labs(title = "Random Forest Variable Importance")
+
+```
+
+
+```{r}
+#| label: glmnet
+results5 <- fit_resamples(
+  workflow(rec |> step_dummy(all_nominal_predictors()) |> 
+  step_normalize(all_numeric_predictors()) ,
+  multinom_reg_glmnet_spec),
+  resamples = folds,
+  control = ctrl,
+  metrics = metrics
+)
+
+results5 %>% 
+  collect_metrics(summarize = TRUE) %>%
+  arrange(desc(mean))
+
+workflow(rec |> 
+           step_dummy(all_nominal_predictors()) |> 
+           step_normalize(all_numeric_predictors()),
+         multinom_reg_glmnet_spec) %>%
+   fit(raw_df) %>%
+   extract_fit_parsnip() %>%
+   vip::vip(num_features = 20) +
+  labs(title = "GLMNet Variable Importance")
+
+```
+
+
+
+```{r}
+#| label: descrim
+
+results6 <- fit_resamples(
+  workflow(rec |>step_dummy(all_nominal_predictors()) |> 
+             step_corr(all_numeric_predictors()) |> 
+             step_normalize(all_numeric_predictors()) , 
+           discrim_flexible_earth_spec),
+  resamples = folds,
+  control = ctrl,
+  metrics = metrics
+)
+
+results6 %>% 
+  collect_metrics(summarize = TRUE) %>%
+  arrange(desc(mean))
+
+workflow(rec |> step_dummy(all_nominal_predictors()) |>  
+           step_corr(all_numeric_predictors()) |> 
+           step_normalize(all_numeric_predictors()) , 
+         discrim_flexible_earth_spec) |> 
+  fit(raw_df) |> 
+  extract_fit_engine() |> 
+  mda::coef.fda()  
+
+
+```
+
+
+```{r}
+#| label: stacks
+ens <- stacks() |>
+  stacks::add_candidates(results) |>
+  stacks::add_candidates(results2) |>
+  stacks::add_candidates(results3) |>
+  stacks::add_candidates(results4) %>% 
+  stacks::add_candidates(results5) %>%
+  stacks::add_candidates(results6) |> 
+  stacks::blend_predictions(
+    metric = metric_set(roc_auc),
+    penalty = c(seq(0.001, 0.05, 0.001)),
+    mixture = c(seq(0.6, 0.95, 0.05,)),
+    non_negative = FALSE,
+    control = tune::control_grid(allow_par = TRUE,
+                                 event_level = "second")
+  ) 
+
+autoplot(ens)
+
+autoplot(ens, "weights")
+
+ensemble <- fit_members(ens)
+
+```
+
+
+```{r}
+
+predict(ensemble, raw_df, type = "class") |> 
+  bind_cols(raw_df) |> 
+  conf_mat(booking_status, .pred_class) |> 
+  autoplot("heatmap") +
+  labs(title = "Training Data Ensemble")
+
+predict(ensemble, raw_df, type = "prob") |> 
+  bind_cols(raw_df) |> 
+  roc_auc(booking_status, .pred_stayed)
+
+```
+
+
+```{r}
+submission_df <- predict(ensemble, 
+        competition_df, 
+        type = "prob") %>%
+  bind_cols(competition_df) %>% 
+  select(id, booking_status = .pred_cancelled)
+
+submission_df |> 
+  ggplot(aes(booking_status)) +
+  geom_histogram(bins = 40)
+
+submission_df %>%
+  write_csv(str_c(path, "submission.csv"))
+```
+
+
+
+
