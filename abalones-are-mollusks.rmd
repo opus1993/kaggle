@@ -501,8 +501,8 @@ param <- wf %>%
 #     mtry = mtry(range = c(5,9)),
       min_n = min_n(range = c(10, 20)),
       tree_depth = tree_depth(range = c(15, 30)),
-      learn_rate = learn_rate(range = c(-0.6, -1)),
-      num_leaves = num_leaves(range = c(10, 170))
+      learn_rate = learn_rate(range = c(-0.5, -1)),
+      num_leaves = num_leaves(range = c(100, 200))
    ) %>%
    dials::finalize(raw_df)
 
