@@ -1,0 +1,517 @@
+---
+title: "Regression with an Abalone Dataset"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+  
+# Introduction  {.tabset .tabset-fade .tabset-pills}
+
+The goal of this competition is to predict the age of abalone from various physical measurements.
+
+My notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+If you fork this on kaggle, be sure to choose the kernel Environment setting for "Always use latest environment"
+
+Lets dive right in.
+
+The Kaggle kernels have many of the common r packages built in.  
+
+## Load libraries
+
+In addition to `tidymodels` we will load the `bonsai` interface to lightgbm.
+
+```{r }
+#| label: setup
+#| warning: false
+#| message: false
+options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/focal/2021-05-17"))
+
+suppressPackageStartupMessages({
+library(tidyverse) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+  
+# library(extrasteps)
+
+library(bonsai) # interface with lightgbm
+
+})
+
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_set(cowplot::theme_minimal_grid())
+
+```
+
+
+## Interchangeability
+
+I prefer to be able to run the same code locally and on a Kaggle kernel.
+
+```{r}
+#| label: interchangeability
+#| warning: false
+#| message: false
+
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s4e4/"
+} else {
+  path <- str_c(here::here("data"),"/")
+}
+
+path
+
+```
+
+## Load Data
+
+So many of the bank balance observations are zero. I will add a flag. I wonder if these model less well than those without the flag.
+
+```{r }
+#| label: load data
+#| warning: false
+#| message: false
+
+preprocessor <- function(dataframe) {
+  dataframe %>%
+    janitor::clean_names() %>% 
+    mutate(across(c(where(is.character)), ~ as.factor(.x)),)
+}
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = TRUE) %>%
+
+  preprocessor() 
+
+features <- raw_df %>%
+  select(-id, -rings) %>%
+  names()
+
+raw_df <- raw_df %>% 
+  distinct(pick(all_of(features)), .keep_all = TRUE)
+
+nom_features <- raw_df %>%
+  select(all_of(features)) %>%
+  select(where(is.character), where(is.factor)) %>%
+  names() 
+
+logical_features <- raw_df %>%
+  select(all_of(features)) %>%
+  select(where(is.logical)) %>%
+  names() 
+
+num_features <- raw_df %>%
+  select(all_of(features)) %>%
+  select(where(is.numeric)) %>%
+  names()
+
+competition_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE)  %>% 
+  preprocessor() 
+
+all_df <-
+    bind_rows(raw_df %>% mutate(source = "train"),
+            competition_df %>% mutate(source = "test"))
+
+```
+
+Nominal features `r nom_features`
+
+Numeric features `r num_features`
+
+
+# EDA {.tabset .tabset-fade .tabset-pills}
+
+## Numeric features
+
+Consider where features require univariate transformation, or clipping outliers.
+
+
+```{r}
+#| label: numeric
+#| warning: false
+#| message: false
+#| fig.height: 12
+#| fig.width: 12
+
+raw_df %>% 
+  select(all_of(num_features), rings) %>% 
+  pivot_longer(-rings,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, fill = ggplot2::cut_number(rings,5))) +
+  geom_histogram(alpha = 0.6, bins = 50) +
+   facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  labs(color = NULL, fill = "Rings",
+       title = "Numeric Feature Univariate Distributions",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+raw_df %>% 
+  select(all_of(num_features), rings) %>% 
+  pivot_longer(-rings,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(sample = value, color = ggplot2::cut_number(rings,5))) + 
+  stat_qq(show.legend = FALSE) + 
+  stat_qq_line() +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())+
+  labs(color = NULL, 
+       title = "Numeric Feature Q-Q Distributions",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+my_bin <- function(data, mapping, ..., low = "#132B43", high = "#56B1F7") {
+  ggplot(data = data, mapping = mapping) +
+    geom_bin2d(...) +
+    scale_fill_gradient(low = low, high = high)
+}
+
+raw_df %>%
+  GGally::ggpairs(
+    mapping = aes(color = ggplot2::cut_number(rings,5)),
+    lower = list(
+      combo = GGally::wrap("facethist", binwidth = 1)
+    )
+  )
+
+```
+
+
+## Counts of Missingness
+                  
+```{r}
+#| label: counts of missingness
+
+raw_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+```
+
+## Counts of Distinct
+               
+```{r}
+#| label: counts of distinct
+               
+raw_df %>% 
+  summarize(
+    across(all_of(features), n_distinct)
+  ) %>%
+  pivot_longer(everything(),
+               names_to = "feature",
+               values_to = "Count of distinct") %>% 
+                   knitr::kable()
+               
+```
+
+## Duplicated
+
+Is this competition transaction already in the training data with a correct label?
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+all_df %>%
+    select(all_of(features), source) %>% 
+    group_by_at(features) %>%
+    mutate(num_dups = n(),
+           dup_id = row_number()) %>%
+    ungroup() %>%
+    group_by(source) %>%
+    mutate(is_duplicated = dup_id > 1) %>%
+    count(is_duplicated) %>% 
+                   knitr::kable()
+               
+
+```
+                   
+## Pairwise Correlations
+                   
+`ggcorrplot` provides a quick look at numeric features where the correlation may be significant. 
+                   
+I will come back and run checks on how the train data and the test data are different.                   
+
+```{r}
+#| label: pairwise correlations
+# Leave blank on no significant coefficient
+
+raw_df %>%
+  select(all_of(num_features)) %>%
+  ggcorrplot::cor_pmat() %>%
+  ggcorrplot::ggcorrplot(
+    hc.order = TRUE,
+    lab = FALSE,
+    type = "lower",
+    insig = "blank"
+  ) +
+  labs(title = "Pairwise Correlations Training Set")
+
+competition_df %>%
+  select(all_of(num_features)) %>%
+  ggcorrplot::cor_pmat() %>%
+  ggcorrplot::ggcorrplot(
+    hc.order = TRUE,
+    lab = FALSE,
+    type = "lower",
+    insig = "blank"
+  ) +
+  labs(title = "Pairwise Correlations Competition Set")
+
+```      
+
+
+## Target
+
+```{r}
+#| label: outcome 
+#| warning: false
+#| message: false
+#| fig.width: 12
+
+raw_df %>% 
+ ggplot(aes(rings)) +
+  geom_histogram() +
+  labs(title = "Outcome: Rings",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+```
+                              
+           
+                
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## Recipe
+                   
+We will tune each modeling algorithm against 10 fold cross validation, stratified for obesity class.
+                 
+
+```{r}
+#| label: recipe
+#| fig.height: 16
+#| fig.width: 12
+
+folds <- vfold_cv(raw_df, 
+                  v = 10,
+                  repeats = 1,
+                  strata = rings)
+
+rec <- recipe(
+    
+    formula(paste0("rings ~ ", 
+               str_c(features,  collapse = " + "))),
+    data = raw_df 
+  ) %>%
+ step_novel(all_nominal_predictors()) %>% 
+# step_robust(all_numeric_predictors()) %>% 
+ step_nzv(all_numeric_predictors())
+
+rec
+                  
+```
+
+## Metric
+
+Root Mean Squared Log Error
+
+
+```{r}
+#| label: custom RMSLE metric
+
+rmsle_impl <- function(truth, estimate, case_weights = NULL) {
+        sqrt(mean(log(1 + estimate) - log(1 + truth))^2)
+}
+
+rmsle_vec <- function(truth, estimate, na_rm = TRUE, case_weights = NULL, ...) {
+  check_numeric_metric(truth, estimate, case_weights)
+
+  if (na_rm) {
+    result <- yardstick_remove_missing(truth, estimate, case_weights)
+
+    truth <- result$truth
+    estimate <- result$estimate
+    case_weights <- result$case_weights
+  } else if (yardstick_any_missing(truth, estimate, case_weights)) {
+    return(NA_real_)
+  }
+
+  rmsle_impl(truth, estimate, case_weights = case_weights)
+}
+
+rmsle <- function(data, ...) {
+  UseMethod("rmsle")
+}
+
+rmsle <- new_numeric_metric(rmsle, direction = "minimize")
+
+rmsle.data.frame <- function(data, truth, estimate, case_weights = NULL, na_rm = TRUE, ...) {
+  
+  numeric_metric_summarizer(
+    name = "rmsle",
+    fn = rmsle_vec,
+    data = data,
+    truth = !!enquo(truth),
+    estimate = !!enquo(estimate),
+    na_rm = na_rm,
+    case_weights = !!enquo(case_weights)
+  )
+  
+}
+
+metrics <- metric_set(rmsle)
+
+
+```
+
+## LightGBM 
+
+```{r}
+#| label: lightgbm engine
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 100L,
+   tree_depth = tune(),
+   learn_rate = 10^-1, # tune(),
+   mtry = tune(),
+   min_n = tune(),
+    loss_reduction = 0
+  ) %>% 
+  set_engine(engine = "lightgbm",
+          #   is_unbalance = TRUE,
+              num_leaves = tune(),
+             num_threads = future::availableCores()
+             ) %>%
+  set_mode(mode = "regression") 
+
+```
+                                                                      
+
+```{r}
+#| label: lgbm fit no zero balances
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 12
+tictoc::tic()
+wf <- workflow(rec  ,
+               boost_tree_lgbm_spec) 
+
+set.seed(42)
+
+ctrl <- finetune::control_sim_anneal(     
+     verbose = FALSE,
+     verbose_iter = TRUE,
+     parallel_over = "everything",
+     save_pred = TRUE,
+     save_workflow = TRUE)
+
+param <- wf %>%
+   extract_parameter_set_dials() %>%
+   recipes::update(
+     mtry = mtry(range = c(5,9)),
+      min_n = min_n(range = c(1, 10)),
+      tree_depth = tree_depth(range = c(6, 25)),
+     # learn_rate = learn_rate(range = c(-1, -2.5)),
+      num_leaves = num_leaves(range = c(30, 70))
+   ) %>%
+   dials::finalize(raw_df)
+
+burnin <- tune_grid(
+  wf,
+  resamples = folds,
+  grid = 6,
+  control = ctrl
+,
+  metrics = metrics,
+  param_info = param
+)
+
+lgbm1_rs <- finetune::tune_sim_anneal(
+  wf,
+  resamples = folds,
+  iter = 6,
+  initial = burnin,
+  control = ctrl,
+  metrics = metrics,
+  param_info = param)
+
+autoplot(lgbm1_rs) +
+  labs(title = "LightGBM hyperparameter tuning",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")      
+                   
+show_best(lgbm1_rs)  %>% 
+     knitr::kable()
+               
+fit <- wf %>%
+  finalize_workflow(select_best(lgbm1_rs)) %>%
+  fit(raw_df)
+
+tictoc::toc()                    
+```
+
+## Feature Importance                   
+                   
+```{r}
+#| label: feature importance
+#| warning: false
+#| message: false                   
+                   
+fit %>% 
+  extract_fit_engine() %>%
+   lightgbm::lgb.importance(percentage = TRUE) %>%
+   lightgbm::lgb.plot.importance(top_n = 30) 
+
+
+                                           
+```
+                   
+ 
+                   
+# The moment of Truth
+
+```{r}
+#| label: performance checks
+#| warning: false
+#| message: false
+                   
+augment(fit, raw_df) %>% 
+    rmsle(rings, .pred)
+
+```
+                   
+## Submission
+                   
+```{r}
+#| label: submission
+#| warning: false
+#| message: false
+                   
+submit_df <- augment(fit, competition_df) %>% 
+  select(id, Rings = .pred)
+
+head(submit_df)  %>% 
+     knitr::kable()      
+                   
+submit_df  %>% 
+  write_csv("submission.csv")
+  
+
+```
