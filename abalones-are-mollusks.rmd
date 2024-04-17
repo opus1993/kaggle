@@ -223,7 +223,7 @@ raw_df %>%
 
 `outForest` is a multivariate anomaly detection method. Each numeric variable is regressed onto all other variables using a random forest. If the scaled absolute difference between observed value and out-of-bag prediction is larger than a prespecified threshold, then a value is considered an outlier.
 
-A benefit of this technique is noise reduction, at least at the 100 most anomylous observations.  A drawback is of applying it at this point to the training data and the cross validation folds is that the CV out of sample estimates of error are smaller than we would see with raw.
+A benefit of this technique is noise reduction, at least at the most anomylous observations.  A drawback is of applying it at this point to the training data and the cross validation folds is that the CV out of sample estimates of error are smaller than we would see with raw.
                    
 Computationally, it is faster to run it here.                   
 
@@ -459,7 +459,7 @@ metrics <- metric_set(rmsle)
 
 boost_tree_lgbm_spec <- 
   boost_tree(
-    trees = 1500L,
+    trees = 2500L,
    tree_depth = tune(),
    learn_rate =  tune(),
 #   mtry = tune(),
@@ -499,10 +499,10 @@ param <- wf %>%
    extract_parameter_set_dials() %>%
    recipes::update(
 #     mtry = mtry(range = c(5,9)),
-      min_n = min_n(range = c(3, 15)),
-      tree_depth = tree_depth(range = c(10, 25)),
-      learn_rate = learn_rate(range = c(-0.8, -1.5)),
-      num_leaves = num_leaves(range = c(60, 100))
+      min_n = min_n(range = c(7, 15)),
+      tree_depth = tree_depth(range = c(15, 30)),
+      learn_rate = learn_rate(range = c(-0.7, -1)),
+      num_leaves = num_leaves(range = c(70, 150))
    ) %>%
    dials::finalize(raw_df)
 
@@ -519,7 +519,7 @@ burnin <- tune_grid(
 lgbm1_rs <- finetune::tune_sim_anneal(
   wf,
   resamples = folds,
-  iter = 8,
+  iter = 10,
   initial = burnin,
   control = ctrl,
   metrics = metrics,
@@ -573,7 +573,7 @@ augment(fit2, raw_df) %>%
     rmsle(rings, .pred)
 
 augment(fit2, raw_df) %>% ggplot(aes(rings, .pred - rings, color = sex)) + geom_jitter() +
-  labs(title = "With Outforest Anomaly Removal")              
+  labs(title = "With Outforest Anomaly Imputation")              
                    
 ```
                    
