@@ -86,14 +86,14 @@ path
 preprocessor <- function(dataframe) {
   dataframe %>%
     janitor::clean_names() %>% 
-    mutate(height = if_else(height > 0.3, 0.3, height)) %>%
     mutate(across(c(where(is.character)), ~ as.factor(.x)),)
 }
 
 raw_df <- read_csv(str_c(path, "train.csv"),
                    show_col_types = TRUE) %>%
 
-  preprocessor() 
+  preprocessor() %>%
+  filter(between(height, 0.0001, 0.3))
 
 features <- raw_df %>%
   select(-id, -rings) %>%
@@ -142,7 +142,9 @@ Numeric features:
 
 Consider where features require univariate transformation, or clipping outliers.
 
-I initially implemented an Outlier section, but went back to preprocess to cap only the high `height` figures.
+I initially implemented an Outlier section, but went back to preprocess to remove the high and low `height` figures from training.
+
+There are a couple outlier `height` values in test as well.
 
 Other kernels make some effort to impute zero `height` figures.
 
@@ -388,7 +390,8 @@ rec <- recipe(
                str_c(features,  collapse = " + "))),
     data = raw_df 
   ) %>%
-# themis::step_upsample(sex) %>%                    
+# themis::step_upsample(sex) %>% 
+ step_ratio(shell_weight, denom = denom_vars(length)) %>%
  step_novel(all_nominal_predictors()) %>% 
  step_nzv(all_numeric_predictors())
 
