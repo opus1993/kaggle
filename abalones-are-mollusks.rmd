@@ -499,10 +499,10 @@ param <- wf %>%
    extract_parameter_set_dials() %>%
    recipes::update(
 #     mtry = mtry(range = c(5,9)),
-      min_n = min_n(range = c(7, 15)),
+      min_n = min_n(range = c(10, 20)),
       tree_depth = tree_depth(range = c(15, 30)),
       learn_rate = learn_rate(range = c(-0.7, -1)),
-      num_leaves = num_leaves(range = c(70, 150))
+      num_leaves = num_leaves(range = c(10, 170))
    ) %>%
    dials::finalize(raw_df)
 
