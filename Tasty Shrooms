@@ -74,7 +74,7 @@ theme_set(cowplot::theme_minimal_grid())
 
 train_spec <- cols(
   id = col_double(),
-  class = col_character(),
+  class = readr::col_factor(),
   `cap-diameter` = col_double(),
   `cap-shape` = col_character(),
   `cap-surface` = col_character(),
@@ -122,7 +122,13 @@ competition_spec <- cols(
   season = col_character()
 )
 
-
+clean_text_field <- function(textcolumn) {
+  case_when(
+      str_detect({{textcolumn}}, ".*[0-9].*") ~ NA,
+      str_length({{textcolumn}}) > 1 ~ NA,
+      .default = {{textcolumn}}
+    )
+}
 
 preprocessor <- function(dataframe) {
 
@@ -130,6 +136,10 @@ dataframe <- dataframe %>%
     janitor::clean_names() %>%
     
     mutate(count_NA = factor(rowSums(is.na(.)))) %>%
+  
+    mutate(across(c(where(is.character)), ~ clean_text_field(.x))) %>%
+
+    unite(col = textstring, where(is.character), na.rm = TRUE, sep = "", remove = FALSE) %>%
     
     mutate(across(c(where(is.character)), ~ as.factor(.x))) 
 
@@ -194,6 +204,11 @@ Nominal features:
 Numeric features: 
 
 `r num_features`
+
+Logical features: 
+
+`r logical_features`
+
 
 Size of the combined train and competition datasets:
 
@@ -420,7 +435,9 @@ rec <- recipe(
                str_c(features,  collapse = " + "))),
     data = bundle_train
   ) %>% 
-  step_novel(all_nominal_predictors())            
+  step_novel(all_nominal_predictors())  %>%
+  textrecipes::step_tokenize(textstring, token = "characters") %>%
+  textrecipes::step_tf(textstring)          
                    
                    
 folds <- vfold_cv(bundle_train, 
