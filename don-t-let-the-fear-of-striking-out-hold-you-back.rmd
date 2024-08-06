@@ -1,0 +1,594 @@
+---
+title: "Predict hits with NEW MLB swing data"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+  
+# Introduction  {.tabset .tabset-fade .tabset-pills}
+
+The goal of this competition is to predict hits with NEW MLB swing data.
+
+My notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+If you fork this on kaggle, be sure to choose the kernel Environment setting for "Always use latest environment"
+
+Lets dive right in.
+
+The Kaggle kernels have many of the common r packages built in.  
+
+## Load libraries
+
+In addition to `tidymodels` we will load the `bonsai` interface to lightgbm.
+
+```{r }
+#| label: setup
+#| warning: false
+#| message: false
+
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/nwds-batted-balls/"
+    
+options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
+# install.packages("vip", quiet = TRUE)
+    
+cores <- future::availableCores()
+
+} else {
+  path <- stringr::str_c(here::here("data"),"/")
+
+cores <- future::availableCores(omit = 1)
+}
+
+ 
+suppressPackageStartupMessages({
+library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+library(bonsai)
+})
+
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_set(cowplot::theme_minimal_grid())
+
+```
+
+
+## Load Data
+
+```{r }
+#| label: load data
+#| warning: false
+#| message: false
+
+
+train_spec <- cols(
+  uid = col_double(),
+  pitch_type = col_character(),
+  release_speed = col_double(),
+  release_pos_x = col_double(),
+  release_pos_z = col_double(),
+  game_type = col_character(),
+  is_lhp = readr::col_factor(),
+  is_lhb = readr::col_factor(),
+  balls = readr::col_factor(),
+  strikes = readr::col_factor(),
+  game_year = readr::col_factor(),
+  pfx_x = col_double(),
+  pfx_z = col_double(),
+  plate_x = col_double(),
+  plate_z = col_double(),
+  on_3b = readr::col_factor(),
+  on_2b = readr::col_factor(),
+  on_1b = readr::col_factor(),
+  outs_when_up = readr::col_factor(),
+  inning = readr::col_factor(),
+  is_top = readr::col_factor(),
+  vx0 = col_double(),
+  vy0 = col_double(),
+  vz0 = col_double(),
+  ax = col_double(),
+  ay = col_double(),
+  az = col_double(),
+  sz_top = col_double(),
+  sz_bot = col_double(),
+  effective_speed = col_double(),
+  release_spin_rate = col_double(),
+  release_extension = col_double(),
+  release_pos_y = col_double(),
+  pitch_number = col_double(),
+  pitch_name = readr::col_factor(),
+  spin_axis = col_double(),
+  spray_angle = col_double(),
+  bat_speed = col_double(),
+  swing_length = col_double(),
+  outcome = col_character(),
+  outcome_code = col_character()
+)
+
+
+competition_spec <- cols(
+  uid = col_double(),
+  pitch_type = col_character(),
+  release_speed = col_double(),
+  release_pos_x = col_double(),
+  release_pos_z = col_double(),
+  game_type = col_character(),
+  is_lhp = readr::col_factor(),
+  is_lhb = readr::col_factor(),
+  balls = readr::col_factor(),
+  strikes = readr::col_factor(),
+  game_year = readr::col_factor(),
+  pfx_x = col_double(),
+  pfx_z = col_double(),
+  plate_x = col_double(),
+  plate_z = col_double(),
+  on_3b = readr::col_factor(),
+  on_2b = readr::col_factor(),
+  on_1b = readr::col_factor(),
+  outs_when_up = readr::col_factor(),
+  inning = readr::col_factor(),
+  is_top = readr::col_factor(),
+  vx0 = col_double(),
+  vy0 = col_double(),
+  vz0 = col_double(),
+  ax = col_double(),
+  ay = col_double(),
+  az = col_double(),
+  sz_top = col_double(),
+  sz_bot = col_double(),
+  effective_speed = col_double(),
+  release_spin_rate = col_double(),
+  release_extension = col_double(),
+  release_pos_y = col_double(),
+  pitch_number = col_double(),
+  pitch_name = readr::col_factor(),
+  spin_axis = col_double(),
+  spray_angle = col_double(),
+  bat_speed = col_double(),
+  swing_length = col_double()
+)
+
+preprocessor <- function(dataframe) {
+
+dataframe <- dataframe %>%
+    janitor::clean_names() %>%
+  
+    mutate(pitch_speed_diff = release_speed - effective_speed, # from Michael Semenoff notebook
+           pitch_location = sqrt(plate_x^2 + plate_z^2),
+           count_pressure = balls - strikes + 1,
+           bat_pitch_speed_ratio = bat_speed / release_speed,
+           swing_efficiency = bat_speed / swing_length) %>%
+  
+    mutate(across(c(where(is.character)), ~ as.factor(.x))) 
+
+return(dataframe)
+}
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   col_types = train_spec,
+                   show_col_types = FALSE) %>%
+          preprocessor() 
+
+tst_df <- read_csv(str_c(path, "test.csv"),
+                   col_types = competition_spec,
+                   show_col_types = FALSE)  %>% 
+  preprocessor() 
+
+all_df <-
+    bind_rows(raw_df %>% mutate(source = "train"),
+              tst_df %>% mutate(source = "test"))
+
+train_df <- all_df %>% 
+  filter(source == "train") %>% 
+  select(-source, -outcome_code, -game_year) %>% 
+  mutate(outcome = factor(outcome, levels = c("out","single","double","triple","home_run")))
+
+competition_df <- all_df %>% 
+  filter(source == "test") %>% 
+  select(-source, -outcome, -outcome_code, -game_year)
+
+features <- train_df %>%
+  select(-uid, -outcome) %>%
+  names()
+
+train_df <- train_df %>% 
+  distinct(pick(all_of(features)), .keep_all = TRUE)
+
+nom_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.character), where(is.factor)) %>%
+  names() 
+
+logical_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.logical)) %>%
+  names() 
+
+num_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.numeric)) %>%
+  names()
+
+bundle_split <- initial_split(train_df, prop = 0.95, strata = outcome)
+bundle_train <- training(bundle_split)
+bundle_test <- testing(bundle_split)
+
+
+```
+
+Nominal features:
+
+`r nom_features`
+
+Numeric features: 
+
+`r num_features`
+
+Logical features: 
+
+`r logical_features`
+
+
+Size of the combined train and competition datasets:
+
+`r nrow(all_df)`
+
+Size of the split made available to machine learning
+
+`r nrow(bundle_train)`
+
+
+# EDA {.tabset .tabset-fade .tabset-pills}
+
+## Numeric features
+
+Consider where features require univariate transformation, or clipping outliers.
+```{r}
+#| label: numeric
+#| warning: false
+#| message: false
+#| fig.height: 24
+#| fig.width: 6
+
+train_df %>% 
+  select(all_of(num_features), outcome ) %>% 
+  pivot_longer(-outcome,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, fill = outcome)) +
+  geom_histogram(bins = 200) +
+   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "top", 
+        plot.title.position = "plot") +
+  labs(color = NULL, fill = NULL,
+       title = "Numeric Feature Univariate Distributions",
+       caption = "Data: MLB Statcast via Baseball Savant | Visual: Jim Gruman")
+
+```
+
+
+## Nominal features
+
+Explore the distribution of outcome class by factor level, and the factor levels that exist in test that do not exist in training.
+
+
+```{r}
+#| label: nominal
+#| warning: false
+#| message: false
+#| fig.height: 18
+#| fig.width: 6
+
+
+if(length(nom_features) >0){
+
+all_df %>% 
+  select(all_of(nom_features), outcome) %>% 
+  mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%
+  pivot_longer(-outcome,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  
+  summarise(n = n(),
+            .by = c(outcome, metric, value)) %>%
+      
+  mutate(value = tidytext::reorder_within(value, n, metric)) %>%
+    
+  ggplot(aes(x = n, y = value, fill = outcome)) +
+  geom_col() +
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+       legend.position = "bottom") +
+  labs(title = "Nominal Feature Counts",
+       fill = NULL,
+       caption = "Data: MLB Statcast via Baseball Savant | Visual: Jim Gruman")
+
+}
+
+```
+
+## Logical features
+
+```{r}
+#| label: logical
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 6
+
+
+if(length(logical_features) >0){
+
+train_df %>% 
+  select(all_of(logical_features), class) %>% 
+  pivot_longer(-class,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(y = value, fill = class)) +
+  geom_bar() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2)) +
+   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+       legend.position = "bottom") +
+  labs(title = "Logical Feature Counts",
+       fill = "Class",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+}
+
+```
+
+## Counts of Missingness
+                  
+```{r}
+#| label: counts of missingness
+
+#naniar::gg_miss_upset(train_df,  nintersects = 6) 
+
+#naniar::vis_miss(train_df |> slice_sample(prop = 0.01))
+
+train_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+                   
+
+                  
+```
+
+## Counts of Distinct
+                   
+               
+```{r}
+#| label: counts of distinct
+               
+raw_df %>%
+  summarize(across(all_of(features), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct train") |>
+  left_join(
+    tst_df %>%
+      summarize(across(all_of(features), n_distinct)) %>%
+      pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct test")
+  ) %>% 
+                   knitr::kable()
+               
+```
+
+## Duplicated
+
+Is this competition transaction already in the training data with a correct label?
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+all_df %>%
+    select(all_of(features), source) %>% 
+    group_by_at(features) %>%
+    mutate(num_dups = n(),
+           dup_id = row_number()) %>%
+    ungroup() %>%
+    group_by(source) %>%
+    mutate(is_duplicated = dup_id > 1) %>%
+    count(is_duplicated) %>% 
+                   knitr::kable()
+               
+
+```
+                   
+
+
+
+## Target
+
+```{r}
+#| label: outcome 
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+
+bundle_train %>% 
+  summarize(outcome_sum = n(),
+            .by = outcome) %>%
+  arrange(outcome_sum) %>%
+  mutate(prop = outcome_sum / nrow(bundle_train)) %>%
+  mutate(ypos = cumsum(prop) - 0.5 * prop) %>%
+
+  ggplot(aes(x = "", y = prop, fill = outcome)) +
+  geom_bar(stat = "identity", width = 1, show.legend = FALSE) +
+  geom_text(aes(y = ypos, label = paste0(outcome
+                                  ,"\n",round(prop,2)*100,"%")),
+            color = "white",
+            nudge_x = 0.3,
+            size = 3) +
+  coord_polar("y", start = 0) +
+  theme_void() + 
+  labs(title = "Outcome",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+```
+                              
+           
+                
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+
+## Recipe
+
+```{r}
+#| label: recipe
+                   
+rec <- recipe(
+    
+    formula(paste0("outcome ~ ", 
+               str_c(features,  collapse = " + "))),
+    data = bundle_train
+  ) %>% 
+  step_novel(all_nominal_predictors()) %>%
+  step_nzv(all_predictors())
+                   
+folds <- vfold_cv(bundle_train, 
+                  v = 3,
+                  repeats = 1,
+                  strata = outcome)    
+                   
+ctrl <- finetune::control_sim_anneal(     
+     verbose = FALSE,
+     verbose_iter = TRUE,
+     parallel_over = "everything",
+     save_pred = FALSE,
+     save_workflow = FALSE)                   
+                                     
+```
+
+
+
+## Lightgbm
+
+```{r}
+#| label: lgbm
+
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 1350L,
+   tree_depth = tune(),
+   learn_rate =  tune(),
+   min_n = tune(),
+   mtry = tune(),
+   loss_reduction = 0
+  ) %>% 
+  set_engine(engine = "lightgbm",
+             is_unbalance = TRUE,
+             num_leaves = tune(),
+             num_threads = cores
+             ) %>%
+  set_mode(mode = "classification") 
+                   
+wf <- workflow(rec,
+               boost_tree_lgbm_spec) 
+
+param <- wf %>%
+   extract_parameter_set_dials() %>%
+   recipes::update(
+      min_n = min_n(range = c(5,20)),
+      tree_depth = tree_depth(range = c(4,30)),
+      learn_rate = learn_rate(range = c(-1.0,-1.6)),
+      num_leaves = num_leaves(range = c(100,400))
+   ) %>%
+   dials::finalize(raw_df)                 
+
+burnin <- tune_grid(
+  wf,
+  grid = 4,
+  resamples = folds,
+  control = ctrl,
+  metrics = metric_set(roc_auc, accuracy),
+  param_info = param)
+
+lgbm_rs <- finetune::tune_sim_anneal(
+  wf,
+  resamples = folds,
+  iter = 3,
+  initial = burnin,
+  control = ctrl,
+  metrics =  metric_set(roc_auc, accuracy),
+  param_info = param) 
+
+show_best(lgbm_rs, metric = "roc_auc")  
+
+autoplot(lgbm_rs)
+
+collect_metrics(lgbm_rs) %>% 
+  filter(.metric == "roc_auc") %>% 
+  mutate(.config = fct_reorder(.config, mean)) %>% 
+  ggplot(aes(mean, .config)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = mean - std_err, xmax = mean + std_err)) +
+  labs(title = "ROC AUC across resample folds with std_err")
+                   
+
+```
+                   
+# Submission
+                   
+```{r}
+#| label: submission
+#| warning: false
+#| message: false
+
+highest_roc <-   select_best(lgbm_rs, metric = "roc_auc")                 
+                   
+final_lgbm <- wf %>%
+    finalize_workflow(highest_roc) 
+
+last_fit(
+  final_lgbm,
+  bundle_split,
+  metrics = metric_set(roc_auc, accuracy)
+) %>%
+  collect_metrics() %>%
+  knitr::kable()
+
+classification_fit <- final_lgbm %>%
+                        fit(bundle_train) 
+
+classification_fit |> 
+  extract_fit_engine() |> 
+  lgb.importance() |> 
+  as_tibble() %>% 
+  ggplot(aes(x = Gain, y = fct_reorder(Feature, Gain))) +
+  geom_col() +
+  labs(title = "Feature Importance", x = "Gain", y = NULL, caption = "LightGBM Model | Visual: Jim Gruman")    
+
+submit_df <-  augment(classification_fit, competition_df) %>%
+       select(uid, out = .pred_out, single = .pred_single, double = .pred_double, triple = .pred_triple, home_run = .pred_home_run)
+
+head(submit_df)  %>% 
+     knitr::kable()      
+
+submit_df  %>% 
+  write_csv("submission.csv")
+```    
