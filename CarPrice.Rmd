@@ -809,7 +809,15 @@ brulee_rs <- tune_grid(wf,
   metrics = metric_set(rmse, mae),
   param_info = param)                   
                    
-                   
+autoplot(brulee_rs)
+
+collect_metrics(brulee_rs) %>% 
+  filter(.metric == "rmse") %>% 
+  mutate(.config = fct_reorder(.config, -mean)) %>% 
+  ggplot(aes(mean, .config)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = mean - std_err, xmax = mean + std_err)) +
+  labs(title = "RMSE across resample folds with std_err")                   
 ```      
                    
 ## Stacks Ensemble                   
@@ -818,7 +826,7 @@ brulee_rs <- tune_grid(wf,
 #| label: stacks
 #| warning: false
 #| message: false
-#| fig.height: 24
+#| fig.height: 6
 #| fig.width: 6  
 car_values_st <- 
   stacks() %>%
@@ -826,7 +834,7 @@ car_values_st <-
   add_candidates(lgbm_rs) %>%
   blend_predictions(      
       metric = metric_set(rmse),
-      penalty = c(10^seq(-1.5, -0.5, 0.1)),
+      penalty = c(10^seq(-2, -0.5, 0.1)),
       non_negative = TRUE,
       control = tune::control_grid(allow_par = TRUE))
                    
