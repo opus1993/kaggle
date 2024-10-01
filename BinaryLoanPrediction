@@ -165,7 +165,7 @@ competition_df <- all_df %>%
   select(-source, -loan_status)
 
 features <- train_df %>%
-  select(-id, -loan_status) %>%
+  select(-id, -loan_status, -cb_person_default_on_file, -cb_person_cred_hist_length) %>%
   names()
 
 train_df <- train_df %>% 
