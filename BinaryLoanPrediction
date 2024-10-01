@@ -110,8 +110,7 @@ preprocessor <- function(dataframe) {
 dataframe <- dataframe %>%
     janitor::clean_names() %>%
     
-    mutate(mismatch = loan_percent_income * person_income - loan_amnt) %>%
-    mutate(mismatch_ratio = loan_percent_income * person_income / loan_amnt) %>%
+    mutate(mismatch_ratio = log1p(loan_percent_income * person_income / loan_amnt)) %>%
     
     mutate(across(c(where(is.character)), ~ as.factor(.x))) 
 
