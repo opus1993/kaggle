@@ -400,7 +400,7 @@ rec <- recipe(
                    
                    
 folds <- vfold_cv(train_df, 
-                  v = 9,
+                  v = 11,
                   repeats = 2,
                   strata = loan_status)    
                    
@@ -449,7 +449,7 @@ param <- wf %>%
       min_n = min_n(range = c(70,130)),
       tree_depth = tree_depth(range = c(4,30)),
       learn_rate = learn_rate(range = c(-1.0,-2.1)),
-      num_leaves = num_leaves(range = c(200,700))
+      num_leaves = num_leaves(range = c(500,900))
    ) %>%
    dials::finalize(raw_df)                 
 
