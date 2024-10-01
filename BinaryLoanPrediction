@@ -110,6 +110,33 @@ preprocessor <- function(dataframe) {
 dataframe <- dataframe %>%
     janitor::clean_names() %>%
     
+    mutate(timebin = case_when(
+      person_age < 30 & cb_person_cred_hist_length < 4 & person_emp_length < 4 ~ "20_lc_lemp",
+      person_age < 30 & cb_person_cred_hist_length >= 4 & person_emp_length < 4 ~ "20_hc_lemp",
+      person_age < 30 & cb_person_cred_hist_length < 4 & person_emp_length >= 4 ~ "20_lc_hemp",
+      person_age < 30 & cb_person_cred_hist_length >= 4 & person_emp_length >= 4 ~ "20_hc_hemp",
+      
+      person_age < 40 & cb_person_cred_hist_length < 4 & person_emp_length < 4 ~ "30_lc_lemp",
+      person_age < 40 & cb_person_cred_hist_length >= 4 & person_emp_length < 4 ~ "30_hc_lemp",
+      person_age < 40 & cb_person_cred_hist_length < 4 & person_emp_length >= 4 ~ "30_lc_hemp",
+      person_age < 40 & cb_person_cred_hist_length >= 4 & person_emp_length >= 4 ~ "30_hc_hemp",
+
+      person_age < 50 & cb_person_cred_hist_length < 4 & person_emp_length < 4 ~ "40_lc_lemp",
+      person_age < 50 & cb_person_cred_hist_length >= 4 & person_emp_length < 4 ~ "40_hc_lemp",
+      person_age < 50 & cb_person_cred_hist_length < 4 & person_emp_length >= 4 ~ "40_lc_hemp",
+      person_age < 50 & cb_person_cred_hist_length >= 4 & person_emp_length >= 4 ~ "40_hc_hemp",
+
+      cb_person_cred_hist_length < 4 & person_emp_length < 4 ~ "50_lc_lemp",
+      cb_person_cred_hist_length >= 4 & person_emp_length < 4 ~ "50_hc_lemp",
+      cb_person_cred_hist_length < 4 & person_emp_length >= 4 ~ "50_lc_hemp",
+      cb_person_cred_hist_length >= 4 & person_emp_length >= 4 ~ "50_hc_hemp",
+      
+      TRUE ~ "problem"
+      
+    )) |>     
+    
+    mutate(dollar_interaction = person_income / loan_amnt * loan_percent_income) |> 
+    
     mutate(across(c(where(is.character)), ~ as.factor(.x))) 
 
 return(dataframe)
@@ -230,14 +257,14 @@ Explore the distribution of outcome class by factor level, and the factor levels
 
 if(length(nom_features) >0){
 
-all_df %>% 
+train_df %>% 
   select(all_of(nom_features), loan_status) %>% 
   mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%
   pivot_longer(-loan_status,
     names_to = "metric",
     values_to = "value"
   ) %>%
-  
+    
   summarise(n = n(),
             .by = c(loan_status, metric, value)) %>%
       
@@ -252,8 +279,8 @@ all_df %>%
         panel.grid.minor = element_blank(),
        legend.position = "bottom") +
   labs(title = "Nominal Feature Counts",
-       fill = "Loan Status", y = NULL,
-       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+       fill = NULL,
+       caption = "Data: Kaggle | Visual: Jim Gruman")
 
 }
 
@@ -396,11 +423,12 @@ rec <- recipe(
     data = train_df
   ) %>% 
   step_novel(all_nominal_predictors())  %>%
-  step_other(all_nominal_predictors())
+  step_other(all_nominal_predictors()) |> 
+  bestNormalize::step_best_normalize(person_income, person_emp_length, dollar_interaction)
                    
                    
 folds <- vfold_cv(train_df, 
-                  v = 11,
+                  v = 3,
                   repeats = 2,
                   strata = loan_status)    
                    
