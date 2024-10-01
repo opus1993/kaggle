@@ -110,8 +110,6 @@ preprocessor <- function(dataframe) {
 dataframe <- dataframe %>%
     janitor::clean_names() %>%
     
-    mutate(mismatch_ratio = log1p(loan_percent_income * person_income / loan_amnt)) %>%
-    
     mutate(across(c(where(is.character)), ~ as.factor(.x))) 
 
 return(dataframe)
@@ -402,7 +400,7 @@ rec <- recipe(
                    
                    
 folds <- vfold_cv(train_df, 
-                  v = 7,
+                  v = 9,
                   repeats = 2,
                   strata = loan_status)    
                    
@@ -457,7 +455,7 @@ param <- wf %>%
 
 burnin <- tune_grid(
   wf,
-  grid = 4,
+  grid = 5,
   resamples = folds,
   control = ctrl,
   metrics = metric_set(roc_auc, accuracy),
