@@ -416,12 +416,44 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
 
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_xgb") |> 
+  autoplot() +
+  labs(title = "XGB Hyperparameter Search")
+
+best_xgb_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("base_xgb") |> 
+  select_best(metric = "roc_auc")  
+  
+dep_models |> 
+  workflowsets::extract_workflow("base_xgb") |> 
+  finalize_workflow(best_xgb_params) |> 
+  fit(train_df) |> 
+  vip::vip(num_features = 30L)
+
+
+
 dep_models %>%
   dplyr::filter(grepl("lgbm", wflow_id)) %>%
   mutate(metrics = map(result, collect_metrics)) %>%
   dplyr::select(wflow_id, metrics) %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
+
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_lgbm") |> 
+  autoplot() +
+  labs(title = "LGBM Hyperparameter Search")
+
+best_lgbm_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("base_lgbm") |> 
+  select_best(metric = "roc_auc")  
+  
+dep_models |> 
+  workflowsets::extract_workflow("base_lgbm") |> 
+  finalize_workflow(best_lgbm_params) |> 
+  fit(train_df) |> 
+  vip::vip(num_features = 30L)
 
 
 dep_stack <- stacks() %>%
@@ -437,7 +469,6 @@ autoplot(dep_stack, type = "members")
 
 classification_fit <- dep_stack %>% 
     fit_members()
-
 
 ```
 
