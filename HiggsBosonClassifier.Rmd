@@ -337,7 +337,7 @@ folds <- vfold_cv(train_df,
 
 boost_tree_lgbm_spec <- 
   boost_tree(
-    trees = 50L,
+    trees = 100L,
    tree_depth = tune(),
    learn_rate =  tune(),
    min_n = tune(),
@@ -354,7 +354,7 @@ boost_tree_lgbm_spec <-
 
 boost_tree_xgb_spec <- 
   boost_tree(
-    trees = 50L,
+    trees = 100L,
     min_n = tune(),
     learn_rate = tune()
   ) %>% 
@@ -380,14 +380,14 @@ xgb_params <- dep_models |>
   extract_workflow("base_xgb") |> 
   parameters() |> 
   update(min_n = min_n(range = c(10,120)),
-         learn_rate = learn_rate())
+         learn_rate = learn_rate(range = c(-2,-1)))
 
 lgbm_params <- dep_models |> 
   extract_workflow("base_lgbm") |> 
   parameters() |> 
   update(tree_depth = tree_depth(range = c(20,90)),
          num_leaves = num_leaves(),
-         learn_rate = learn_rate(),
+         learn_rate = learn_rate(range = c(-2,-1)),
           min_n = min_n(range = c(40,120)))
 
 dep_models <- dep_models |> 
@@ -399,7 +399,7 @@ dep_models <- dep_models |>
     param_info = xgb_params,
     id = "base_xgb"
   ) |> 
-   workflow_map("tune_grid", resamples = folds, grid = 3, 
+   workflow_map("tune_grid", resamples = folds, grid = 9, 
                 metrics = metric_set(roc_auc), verbose = TRUE)
 
 autoplot(dep_models) +
