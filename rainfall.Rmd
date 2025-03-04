@@ -1,1 +1,664 @@
-{"metadata":{"kernelspec":{"display_name":"R","language":"R","name":"ir"},"language_info":{"mimetype":"text/x-r-source","name":"R","pygments_lexer":"r","version":"3.4.2","file_extension":".r","codemirror_mode":"r"},"kaggle":{"accelerator":"none","dataSources":[{"sourceId":91714,"databundleVersionId":11251744,"sourceType":"competition"}],"isInternetEnabled":true,"language":"rmarkdown","sourceType":"script","isGpuEnabled":false}},"nbformat_minor":4,"nbformat":4,"cells":[{"source":"<a href=\"https://www.kaggle.com/code/jimgruman/rainfall?scriptVersionId=225555535\" target=\"_blank\"><img align=\"left\" alt=\"Kaggle\" title=\"Open in Kaggle\" src=\"https://kaggle.com/static/images/open-in-kaggle.svg\"></a>","metadata":{},"cell_type":"markdown"},{"cell_type":"code","source":"---\ntitle: \"Rainfall\"\ndate: '`r Sys.Date()`'\noutput:\n  html_document:\n    number_sections: true\n    fig_caption: true\n    toc: true\n    fig_width: 7\n    fig_height: 4.5\n    theme: cosmo\n    highlight: tango\n    code_folding: hide\n---\n  \n# Introduction  {.tabset .tabset-fade .tabset-pills}\n\nThe goal of this competition is to predict rainfall for each day of the year.\n\nMy notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.\n\nLets dive right in.\n\nThe Kaggle kernels have many of the common r packages built in.  \n\n## Load libraries\n\nIn addition to `tidymodels` we will load the `bonsai` interface to lightgbm.\n\n```{r }\n#| label: setup\n#| warning: false\n#| message: false\n\nif (dir.exists(\"/kaggle\")){\n  path <- \"/kaggle/input/playground-series-s5e3/\"\n\noptions(repos = c(CRAN = \"https://packagemanager.posit.co/cran/2021-03-22\"))\nremotes::install_github(\"tidyverts/fable.binary\", quiet = TRUE)\nremotes::install_github(\"tidymodels/plsmod\", quiet = TRUE)    \n    \ncores <- future::availableCores()\n\n} else {\n  path <- stringr::str_c(here::here(\"data\"),\"/\")\n  orig_path <- stringr::str_c(here::here(\"data\"),\"/\")\n\n  cores <- future::availableCores(omit = 7)\n}\n \nsuppressPackageStartupMessages({\nlibrary(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages\nlibrary(tidymodels) # metapackage see https://www.tidymodels.org/\n\nlibrary(plsmod)\n    \nlibrary(bonsai)  \nlibrary(stacks)\n # interface to lightgbm\n\n})\n\ntidymodels_prefer()\n\noptions(tidymodels.dark = TRUE)\n\ntheme_set(ggdark::dark_theme_minimal())\n\n```\n\n## Load Data\n\n\n```{r }\n#| label: load data\n#| warning: false\n#| message: false\n\npreprocessor <- function(dataframe) {\n\ndataframe <- dataframe %>%\n    janitor::clean_names() |>\n  \n    mutate(year = id %/% 365 ,\n           day = id - year * 365 ) |> \n\n    mutate(across(c(where(is.character)), ~ as.factor(.x))) \n\nreturn(dataframe)\n}\n\nraw_df <- read_csv(str_c(path, \"train.csv\"),\n                   show_col_types = FALSE) |> \n          mutate(rainfall= as.character(rainfall)) |> \n          preprocessor() \n\ntst_df <- read_csv(str_c(path, \"test.csv\"),\n                   show_col_types = FALSE)  |>  \n  preprocessor() \n\n# because we already know the test set, let's remove the train set factor levels that do not correspond with anything on the test set\nfor (col in names(raw_df)) {\n    if (is.factor(raw_df[[col]]) & col != \"rainfall\") {\n      # Get levels in train and test dataframes\n      raw_levels <- levels(raw_df[[col]])\n      tst_levels <- levels(tst_df[[col]])\n      \n      # Identify levels in train not in test\n      new_levels <- setdiff(raw_levels, tst_levels)\n      \n      # Set these levels to NA in train dataframe\n      raw_df[[col]] <- factor(raw_df[[col]], levels = c(tst_levels, new_levels))\n      raw_df[[col]][raw_df[[col]] %in% new_levels] <- NA_character_\n    }\n  }\n\n# the synthetic playground competitions seem to perform better when numerics are also included as factors\nall_df <-\n    bind_rows(raw_df %>% mutate(source = \"train\"),\n              tst_df %>% mutate(source = \"test\")) \n\n\ntrain_df <- all_df %>% \n  filter(source == \"train\") %>% \n  select(-source) \n\ncompetition_df <- all_df %>% \n  filter(source == \"test\") %>% \n  select(-source, -rainfall)\n\n\n```\n\n\n\n# EDA {.tabset .tabset-fade .tabset-pills}\n\n## Time Series\n\nThere is a seasonal component. \n\n```{r}\n#| label: time series\n#| warning: false\n#| message: false\n#| fig.width: 6\n\nlibrary(fable)\nlibrary(feasts)\nlibrary(fable.binary)\n\ntrain_df |> \n  group_by(year, week = day %/% 7) |> \n  summarize(rainfall = mean(rainfall == 1)) |> \n  ggplot(aes(week, rainfall, color = factor(year), group = year)) +\n    geom_smooth(se = FALSE) +\n    scale_color_brewer(direction = 1)\n\nrainfall_ts <- train_df |> \n  mutate(Date = as.Date(\"2010-01-01\") + day + year*365, rainfall = rainfall == 1) |> \n  select(Date, rainfall, sunshine, cloud) |> \n  fable.binary::as_tsibble()\n\nrainfall_fit <- rainfall_ts |> \n  model(\n        nn = BINNET(rainfall ~ fourier(K = 1, period = \"year\"))\n  ) \n\ntrain_df <- train_df |> \n  mutate(Date = as.Date(\"2010-01-01\") + day + year*365) |> \n  left_join(fitted(rainfall_fit), by = join_by(Date)) |> \n  rename(seasonal_chance = .fitted) |> \n  select(-Date, -.model)\n\nfc <- forecast(rainfall_fit, \n               new_data =  competition_df |> \n  mutate(Date = as.Date(\"2010-01-01\") + day + year*365) |> \n      select(Date, sunshine,cloud) |> \n  fable.binary::as_tsibble(),\n               h = \"2 years\")\n\nas_tibble(fc) |>\n    ggplot(aes(x = Date, y = .mean, col = .model)) +\n    geom_line(show.legend = FALSE) +\n    labs(y = \"Probability of rain\")\n\ncompetition_df <- competition_df |> \n  bind_cols(as_tibble(fc) |>  select(.mean)) |> \n  rename(seasonal_chance = .mean) \n\n```\n\n## Other Features\n\n```{r}\n#| label: Features\n#| warning: false\n#| message: false\n#| fig.width: 6\n\n\nfeatures <- train_df %>%\n  select(-id, -rainfall) |> \n  names()\n\ntrain_df <- train_df %>% \n  distinct(pick(all_of(features)), .keep_all = TRUE)\n\nnom_features <- train_df %>%\n  select(all_of(features)) %>%\n  select(where(is.character), where(is.factor)) %>%\n  names() \n\nlogical_features <- train_df %>%\n  select(all_of(features)) %>%\n  select(where(is.logical)) %>%\n  names() \n\nnum_features <- train_df %>%\n  select(all_of(features)) %>%\n  select(where(is.numeric)) %>%\n  names()\n```\n\nNominal features:\n\n`r nom_features`\n\nNumeric features: \n\n`r num_features`\n\nLogical features: \n\n`r logical_features`\n\n\nSize of the combined train and competition datasets:\n\n`r nrow(all_df)`\n\nSize of the split made available to machine learning\n\n`r nrow(train_df)`\n\n\n\n## Numeric features\n\n```{r}\n#| label: numeric\n#| warning: false\n#| message: false\n#| fig.height: 16\n#| fig.width: 6\n\ntrain_df %>% \n  select(all_of(num_features), rainfall) %>% \n  pivot_longer(-rainfall,\n    names_to = \"metric\",\n    values_to = \"value\"\n  ) %>%\n  ggplot(aes(value, fill = rainfall)) +\n  geom_histogram(show.legend = FALSE, bins = 200) +\n   facet_wrap(vars(metric), scales = \"free\", ncol = 2) +\n  theme(panel.grid.major = element_blank(),\n        panel.grid.minor = element_blank(),\n        plot.title.position = \"plot\") +\n  labs(color = NULL, fill = \"Loan Status\",\n       title = \"Numeric Feature Univariate Distributions\",\n       caption = \"Data: Kaggle.com | Visual: Jim Gruman\")\n\n```\n\n\n\n## Counts of Missingness\n\nThe test set is missing one wind direction. We will fill it in with the median of all of the data.\n                  \n```{r}\n#| label: counts of missingness\n\ntrain_df %>% \n  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% \n  pivot_longer(everything(),\n              names_to = \"feature\",\n              values_to = \"Count of Missing\") %>% \n                   knitr::kable()\n\ncompetition_df %>% \n  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% \n  pivot_longer(everything(),\n              names_to = \"feature\",\n              values_to = \"Count of Missing\") %>% \n                   knitr::kable()\n\ncompetition_df <- competition_df %>% \n  mutate(across(where(is.numeric), ~replace_na(., median(., na.rm=TRUE))))          \n\n```\n\n## Counts of Distinct\n                   \n               \n```{r}\n#| label: counts of distinct\n               \ntrain_df %>%\n  summarize(across(all_of(features), n_distinct)) %>%\n  pivot_longer(everything(), names_to = \"feature\", values_to = \"Count of distinct train\") |>\n  left_join(\n    competition_df %>%\n      summarize(across(all_of(features), n_distinct)) %>%\n      pivot_longer(everything(), names_to = \"feature\", values_to = \"Count of distinct test\")\n  ) %>% \n                   knitr::kable()\n               \n```\n\n## Duplicated\n\nIs this competition transaction already in the training data with a correct rainfall?\n\n```{r}\n#| label: duplicates\n#| warning: false\n#| message: false\n\nbind_rows(train_df %>% mutate(source = \"train\"),\n              competition_df %>% mutate(rainfall= NA_character_, source = \"test\")) |> \n    group_by_at(features) %>%\n    mutate(num_dups = n(),\n           dup_id = row_number()) %>% \n    ungroup() %>%\n    group_by(source) %>%\n    mutate(is_duplicated = dup_id > 1) %>% \n    count(is_duplicated) %>% \n                   knitr::kable()\n               \n\n```\n                   \n\n\n\n## Target\n\n```{r}\n#| label: outcome \n#| warning: false\n#| message: false\n#| fig.width: 6\n\n\ntrain_df %>%\n  summarize(outcome_sum = n(), .by = rainfall) %>%\n  arrange(-outcome_sum) %>%\n  mutate(prop = outcome_sum / nrow(train_df)) %>%\n  mutate(ypos = cumsum(prop) - 0.5 * prop) %>%\n  ggplot(aes(x = \"\", y = prop, fill = rainfall)) +\n  geom_bar(stat = \"identity\",\n           width = 1,\n           show.legend = FALSE) +\n  geom_text(\n    aes(\n      y = ypos,\n      label= paste0(rainfall\n                     , \"\\n\", round(prop, 2) * 100, \"%\")\n    ),\n    color = \"white\",\n    nudge_x = 0,\n    size = 3\n  ) +\n  coord_polar(\"y\", start = 0) +\n  theme(\n    axis.text = element_blank(),\n    axis.title = element_blank()  ) +\n  labs(title = \"Rainfall\", caption = \"Data: Kaggle.com | Visual: Jim Gruman\")\n\n```                            \n           \n                \n# Machine Learning {.tabset .tabset-fade .tabset-pills}\n\n## Recipe\n\n```{r}\n#| label: recipe\n\nbase_rec <- recipe(\n    \n    formula(paste0(\"rainfall ~ \", \n               str_c(features,  collapse = \" + \"))),\n    data = train_df\n  ) %>% \n\n  step_harmonic(winddirection, \n                cycle_size = 300, \n                frequency = c(2,5,6,7,8),\n                starting_val = 10,\n                keep_original_cols = TRUE) |>                       \n\n  step_zv(all_predictors()) %>%\n  step_normalize(all_predictors())\n\n\nfolds <- vfold_cv(train_df, \n                  v = 17,\n                  strata = rainfall)                           \n                                     \n```\n\n\n\n## Workflowset Ensemble\n\n```{r}\n#| label: workflowset\n#| warning: false\n#| message: false\n#| fig.width: 12\n\nboost_tree_lgbm_spec <- \n  boost_tree(\n    trees = 600L,\n   tree_depth = tune(),\n   learn_rate =  tune(),\n   min_n = tune(),\n   sample_size = 0.85\n#   mtry = tune(),\n#   loss_reduction = 9e-9\n  ) %>% \n  set_engine(engine = \"lightgbm\",\n             is_unbalance = TRUE,\n             num_leaves = tune(),\n             num_threads = cores\n       #      boosting = \"goss\"   # this may slow the runtime\n             ) %>%\n  set_mode(mode = \"classification\") \n\nboost_tree_xgb_spec <- \n  boost_tree(\n    trees = 600L,\n    min_n = tune(),\n    learn_rate = tune(),\n   sample_size = 0.85\n  ) %>% \n  set_engine(engine = \"xgboost\", nthread = cores) %>%\n  set_mode(mode = \"classification\")        \n\nsvm_rbf_kernlab_spec <-\n  svm_rbf(cost = tune(), rbf_sigma = tune()) %>%\n  set_engine('kernlab') %>%\n  set_mode('classification')\n\npls_mixOmics_spec <-\n  pls(predictor_prop = tune(), num_comp = tune()) %>%\n  set_engine('mixOmics') %>%\n  set_mode('classification')\n\ndep_models <- \n   workflow_set(\n      preproc = list(base = base_rec,\n                     base = base_rec,\n                     base = base_rec,\n                     base = base_rec),\n      models = list(xgb = boost_tree_xgb_spec,\n                    lgbm = boost_tree_lgbm_spec,\n                    svm = svm_rbf_kernlab_spec,\n                    pls = pls_mixOmics_spec),\n      cross = FALSE\n   ) %>% \n  option_add_parameters() |> \n  option_add(\n    control = control_stack_grid(),\n    metrics = metric_set(mn_log_loss)\n  )\n                   \nxgb_params <- dep_models |> \n  extract_workflow(\"base_xgb\") |> \n  parameters() |> \n  update(min_n = min_n(range = c(10,120)),\n         learn_rate = learn_rate(range = c(-2,-1)))\n\nlgbm_params <- dep_models |> \n  extract_workflow(\"base_lgbm\") |> \n  parameters() |> \n  update(tree_depth = tree_depth(range = c(20,90)),\n         num_leaves = num_leaves(),\n         learn_rate = learn_rate(range = c(-2,-1)),\n          min_n = min_n(range = c(40,120)))\n\nsvm_params <- dep_models |> \n    extract_workflow(\"base_svm\") |> \n  parameters() |> \n  update(\n    cost = cost(),\n    rbf_sigma = dials::rbf_sigma())\n\ndep_models <- dep_models |> \n  option_add(\n    param_info = lgbm_params,\n    id = \"base_lgbm\"\n  ) |> \n  option_add(\n    param_info = xgb_params,\n    id = \"base_xgb\"\n  ) |> \n  option_add(\n    param_info = svm_params,\n    id = \"base_svm\"\n  ) |> \n   workflow_map(\"tune_grid\", resamples = folds, grid = 11, \n                metrics = metric_set(roc_auc), verbose = TRUE)\n\nrank_results(dep_models, rank_metric = \"roc_auc\", select_best = TRUE)                    \n\nautoplot(dep_models) +\n  geom_text(aes(y = mean -0.03, label= wflow_id), angle = 90, hjust = 1)+\n  theme(legend.position = \"none\")\n\n```\n\n## Hyperparameters and Feature Importance\n\n```{r }                   \n#| label: XGB Details\n#| warning: false\n#| message: false                   \n                   \n\ndep_models %>%\n  dplyr::filter(grepl(\"xgb\", wflow_id)) %>%\n  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%\n  dplyr::select(wflow_id, metrics) %>%\n  tidyr::unnest(cols = metrics) |> \n  arrange(desc(mean))\n\ndep_models |> \n  workflowsets::extract_workflow_set_result(\"base_xgb\") |> \n  autoplot() +\n  labs(title = \"XGB Hyperparameter Search\")\n\nbest_xgb_params <- dep_models |> \n  workflowsets::extract_workflow_set_result(\"base_xgb\") |> \n  select_best(metric = \"roc_auc\")  \n  \ndep_models |> \n  workflowsets::extract_workflow(\"base_xgb\") |> \n  finalize_workflow(best_xgb_params) |> \n  fit(train_df) |> \n  vip::vip(num_features = 30L)\n```\n\n\n```{r }                   \n#| label: lgbm Details\n#| warning: false\n#| message: false                   \n                                      \n\n\ndep_models %>%\n  dplyr::filter(grepl(\"lgbm\", wflow_id)) %>%\n  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%\n  dplyr::select(wflow_id, metrics) %>%\n  tidyr::unnest(cols = metrics) |> \n  arrange(desc(mean))\n\ndep_models |> \n  workflowsets::extract_workflow_set_result(\"base_lgbm\") |> \n  autoplot() +\n  labs(title = \"LGBM Hyperparameter Search\")\n\nbest_lgbm_params <- dep_models |> \n  workflowsets::extract_workflow_set_result(\"base_lgbm\") |> \n  select_best(metric = \"roc_auc\")  \n  \ndep_models |> \n  workflowsets::extract_workflow(\"base_lgbm\") |> \n  finalize_workflow(best_lgbm_params) |> \n  fit(train_df) |> \n  vip::vip(num_features = 30L)\n\n```\n\n\n```{r }                   \n#| label: svm Details\n#| warning: false\n#| message: false \n                   \ndep_models %>%\n  dplyr::filter(grepl(\"svm\", wflow_id)) %>%\n  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%\n  dplyr::select(wflow_id, metrics) %>%\n  tidyr::unnest(cols = metrics) |> \n  arrange(desc(mean))\n\n```\n\n\n```{r }                   \n#| label: pls Details\n#| warning: false\n#| message: false                    \ndep_models %>%\n  dplyr::filter(grepl(\"pls\", wflow_id)) %>%\n  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%\n  dplyr::select(wflow_id, metrics) %>%\n  tidyr::unnest(cols = metrics) |> \n  arrange(desc(mean))\n```\n\n## Ensemble Stack                   \n\n```{r }                   \n#| label: Stack\n#| warning: false\n#| message: false \n\ndep_stack <- stacks() %>%\n  add_candidates(dep_models) %>%\n  blend_predictions(  metric = metric_set(roc_auc),\n      penalty = c(10^seq(-1.7, -0.3, 0.1)),\n      non_negative = TRUE,\n      control = tune::control_grid(allow_par = TRUE))\n\nautoplot(dep_stack)\nautoplot(dep_stack, type = \"weights\")\nautoplot(dep_stack, type = \"members\")                   \n\nclassification_fit <- dep_stack %>% \n    fit_members()\n\n```\n\n# Performance {.tabset .tabset-fade .tabset-pills}\n\n## Submission\n```{r }                   \n#| label: submission\n#| warning: false\n#| message: false\n                   \naugment(classification_fit, train_df) %>% \n  conf_mat(rainfall, .pred_class) %>%\n  yardstick:::autoplot.conf_mat(type = \"heatmap\")\n\nsubmit_df <-  augment(classification_fit , competition_df, type= \"prob\") %>%\n       transmute(id = round(id), rainfall = .pred_1)\n\nhead(submit_df)  %>% \n     knitr::kable()      \n\nsubmit_df  %>% \n  write_csv(\"submission.csv\")\n```  ","metadata":{"_uuid":"d7508e7e-1415-4cf5-8d55-be725a2508b8","_cell_guid":"4d50f059-4837-4432-b32a-42c4ba709dfe","trusted":true,"collapsed":false,"jupyter":{"outputs_hidden":false}},"outputs":[],"execution_count":null}]}
+---
+title: "Rainfall"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+  
+# Introduction  {.tabset .tabset-fade .tabset-pills}
+
+The goal of this competition is to predict rainfall for each day of the year.
+
+My notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+The Kaggle kernels have many of the common r packages built in.  
+
+## Load libraries
+
+In addition to `tidymodels` we will load the `bonsai` interface to lightgbm.
+
+```{r }
+#| label: setup
+#| warning: false
+#| message: false
+
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s5e3/"
+
+options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
+remotes::install_github("tidyverts/fable.binary", quiet = TRUE)
+remotes::install_github("tidymodels/plsmod", quiet = TRUE)    
+    
+cores <- future::availableCores()
+
+} else {
+  path <- stringr::str_c(here::here("data"),"/")
+  orig_path <- stringr::str_c(here::here("data"),"/")
+
+  cores <- future::availableCores(omit = 7)
+}
+ 
+suppressPackageStartupMessages({
+library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+
+library(plsmod)
+    
+library(bonsai)  
+library(stacks)
+ # interface to lightgbm
+
+})
+
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_set(ggdark::dark_theme_minimal())
+
+```
+
+## Load Data
+
+
+```{r }
+#| label: load data
+#| warning: false
+#| message: false
+
+preprocessor <- function(dataframe) {
+
+dataframe <- dataframe %>%
+    janitor::clean_names() |>
+  
+    mutate(year = id %/% 365 ,
+           day = id - year * 365 ) |> 
+
+    mutate(across(c(where(is.character)), ~ as.factor(.x))) 
+
+return(dataframe)
+}
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) |> 
+          mutate(rainfall= as.character(rainfall)) |> 
+          preprocessor() 
+
+tst_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE)  |>  
+  preprocessor() 
+
+# because we already know the test set, let's remove the train set factor levels that do not correspond with anything on the test set
+for (col in names(raw_df)) {
+    if (is.factor(raw_df[[col]]) & col != "rainfall") {
+      # Get levels in train and test dataframes
+      raw_levels <- levels(raw_df[[col]])
+      tst_levels <- levels(tst_df[[col]])
+      
+      # Identify levels in train not in test
+      new_levels <- setdiff(raw_levels, tst_levels)
+      
+      # Set these levels to NA in train dataframe
+      raw_df[[col]] <- factor(raw_df[[col]], levels = c(tst_levels, new_levels))
+      raw_df[[col]][raw_df[[col]] %in% new_levels] <- NA_character_
+    }
+  }
+
+# the synthetic playground competitions seem to perform better when numerics are also included as factors
+all_df <-
+    bind_rows(raw_df %>% mutate(source = "train"),
+              tst_df %>% mutate(source = "test")) 
+
+
+train_df <- all_df %>% 
+  filter(source == "train") %>% 
+  select(-source) 
+
+competition_df <- all_df %>% 
+  filter(source == "test") %>% 
+  select(-source, -rainfall)
+
+
+```
+
+
+
+# EDA {.tabset .tabset-fade .tabset-pills}
+
+## Time Series
+
+There is a seasonal component. 
+
+```{r}
+#| label: time series
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+library(fable)
+library(feasts)
+library(fable.binary)
+
+train_df |> 
+  group_by(year, week = day %/% 7) |> 
+  summarize(rainfall = mean(rainfall == 1)) |> 
+  ggplot(aes(week, rainfall, color = factor(year), group = year)) +
+    geom_smooth(se = FALSE) +
+    scale_color_brewer(direction = 1)
+
+rainfall_ts <- train_df |> 
+  mutate(Date = as.Date("2010-01-01") + day + year*365, rainfall = rainfall == 1) |> 
+  select(Date, rainfall, sunshine, cloud) |> 
+  fable.binary::as_tsibble()
+
+rainfall_fit <- rainfall_ts |> 
+  model(
+        nn = BINNET(rainfall ~ fourier(K = 1, period = "year"))
+  ) 
+
+train_df <- train_df |> 
+  mutate(Date = as.Date("2010-01-01") + day + year*365) |> 
+  left_join(fitted(rainfall_fit), by = join_by(Date)) |> 
+  rename(seasonal_chance = .fitted) |> 
+  select(-Date, -.model)
+
+fc <- forecast(rainfall_fit, 
+               new_data =  competition_df |> 
+  mutate(Date = as.Date("2010-01-01") + day + year*365) |> 
+      select(Date, sunshine,cloud) |> 
+  fable.binary::as_tsibble(),
+               h = "2 years")
+
+as_tibble(fc) |>
+    ggplot(aes(x = Date, y = .mean, col = .model)) +
+    geom_line(show.legend = FALSE) +
+    labs(y = "Probability of rain")
+
+competition_df <- competition_df |> 
+  bind_cols(as_tibble(fc) |>  select(.mean)) |> 
+  rename(seasonal_chance = .mean) 
+
+```
+
+## Other Features
+
+```{r}
+#| label: Features
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+
+features <- train_df %>%
+  select(-id, -rainfall) |> 
+  names()
+
+train_df <- train_df %>% 
+  distinct(pick(all_of(features)), .keep_all = TRUE)
+
+nom_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.character), where(is.factor)) %>%
+  names() 
+
+logical_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.logical)) %>%
+  names() 
+
+num_features <- train_df %>%
+  select(all_of(features)) %>%
+  select(where(is.numeric)) %>%
+  names()
+```
+
+Nominal features:
+
+`r nom_features`
+
+Numeric features: 
+
+`r num_features`
+
+Logical features: 
+
+`r logical_features`
+
+
+Size of the combined train and competition datasets:
+
+`r nrow(all_df)`
+
+Size of the split made available to machine learning
+
+`r nrow(train_df)`
+
+
+
+## Numeric features
+
+```{r}
+#| label: numeric
+#| warning: false
+#| message: false
+#| fig.height: 16
+#| fig.width: 6
+
+train_df %>% 
+  select(all_of(num_features), rainfall) %>% 
+  pivot_longer(-rainfall,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, fill = rainfall)) +
+  geom_histogram(show.legend = FALSE, bins = 200) +
+   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title.position = "plot") +
+  labs(color = NULL, fill = "Loan Status",
+       title = "Numeric Feature Univariate Distributions",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+```
+
+
+
+## Counts of Missingness
+
+The test set is missing one wind direction. We will fill it in with the median of all of the data.
+                  
+```{r}
+#| label: counts of missingness
+
+train_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+
+competition_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+
+competition_df <- competition_df %>% 
+  mutate(across(where(is.numeric), ~replace_na(., median(., na.rm=TRUE))))          
+
+```
+
+## Counts of Distinct
+                   
+               
+```{r}
+#| label: counts of distinct
+               
+train_df %>%
+  summarize(across(all_of(features), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct train") |>
+  left_join(
+    competition_df %>%
+      summarize(across(all_of(features), n_distinct)) %>%
+      pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct test")
+  ) %>% 
+                   knitr::kable()
+               
+```
+
+## Duplicated
+
+Is this competition transaction already in the training data with a correct rainfall?
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+
+bind_rows(train_df %>% mutate(source = "train"),
+              competition_df %>% mutate(rainfall= NA_character_, source = "test")) |> 
+    group_by_at(features) %>%
+    mutate(num_dups = n(),
+           dup_id = row_number()) %>% 
+    ungroup() %>%
+    group_by(source) %>%
+    mutate(is_duplicated = dup_id > 1) %>% 
+    count(is_duplicated) %>% 
+                   knitr::kable()
+               
+
+```
+                   
+
+
+
+## Target
+
+```{r}
+#| label: outcome 
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+
+train_df %>%
+  summarize(outcome_sum = n(), .by = rainfall) %>%
+  arrange(-outcome_sum) %>%
+  mutate(prop = outcome_sum / nrow(train_df)) %>%
+  mutate(ypos = cumsum(prop) - 0.5 * prop) %>%
+  ggplot(aes(x = "", y = prop, fill = rainfall)) +
+  geom_bar(stat = "identity",
+           width = 1,
+           show.legend = FALSE) +
+  geom_text(
+    aes(
+      y = ypos,
+      label= paste0(rainfall
+                     , "\n", round(prop, 2) * 100, "%")
+    ),
+    color = "white",
+    nudge_x = 0,
+    size = 3
+  ) +
+  coord_polar("y", start = 0) +
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank()  ) +
+  labs(title = "Rainfall", caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+```                            
+           
+                
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## Recipe
+
+```{r}
+#| label: recipe
+
+base_rec <- recipe(
+    
+    formula(paste0("rainfall ~ ", 
+               str_c(features,  collapse = " + "))),
+    data = train_df
+  ) %>% 
+
+  step_harmonic(winddirection, 
+                cycle_size = 300, 
+                frequency = c(2,5,6,7,8),
+                starting_val = 10,
+                keep_original_cols = TRUE) |>                 
+
+  step_lag(pressure, maxtemp, temparature, mintemp, dewpoint, humidity, cloud, sunshine, 
+           winddirection, windspeed) |> 
+  
+  step_impute_median(all_predictors()) |>                  
+
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+
+folds <- vfold_cv(train_df, 
+                  v = 13,
+                  strata = rainfall)                           
+                                     
+```
+
+
+
+## Workflowset Ensemble
+
+```{r}
+#| label: workflowset
+#| warning: false
+#| message: false
+#| fig.width: 12
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 00L,
+   tree_depth = tune(),
+   learn_rate =  tune(),
+   min_n = tune(),
+   sample_size = 0.85
+#   mtry = tune(),
+#   loss_reduction = 9e-9
+  ) %>% 
+  set_engine(engine = "lightgbm",
+             is_unbalance = TRUE,
+             num_leaves = tune(),
+             num_threads = cores
+       #      boosting = "goss"   # this may slow the runtime
+             ) %>%
+  set_mode(mode = "classification") 
+
+boost_tree_xgb_spec <- 
+  boost_tree(
+    trees = 500L,
+    min_n = tune(),
+    learn_rate = tune(),
+   sample_size = 0.85
+  ) %>% 
+  set_engine(engine = "xgboost", nthread = cores) %>%
+  set_mode(mode = "classification")        
+
+svm_rbf_kernlab_spec <-
+  svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_engine('kernlab') %>%
+  set_mode('classification')
+
+pls_mixOmics_spec <-
+  pls(predictor_prop = tune(), num_comp = tune()) %>%
+  set_engine('mixOmics') %>%
+  set_mode('classification')
+
+dep_models <- 
+   workflow_set(
+      preproc = list(base = base_rec,
+                     base = base_rec,
+                     base = base_rec,
+                     base = base_rec),
+      models = list(xgb = boost_tree_xgb_spec,
+                    lgbm = boost_tree_lgbm_spec,
+                    svm = svm_rbf_kernlab_spec,
+                    pls = pls_mixOmics_spec),
+      cross = FALSE
+   ) %>% 
+  option_add_parameters() |> 
+  option_add(
+    control = control_stack_grid(),
+    metrics = metric_set(mn_log_loss)
+  )
+                   
+xgb_params <- dep_models |> 
+  extract_workflow("base_xgb") |> 
+  parameters() |> 
+  update(min_n = min_n(range = c(10,120)),
+         learn_rate = learn_rate(range = c(-2,-1)))
+
+lgbm_params <- dep_models |> 
+  extract_workflow("base_lgbm") |> 
+  parameters() |> 
+  update(tree_depth = tree_depth(range = c(20,90)),
+         num_leaves = num_leaves(),
+         learn_rate = learn_rate(range = c(-2,-1)),
+          min_n = min_n(range = c(40,120)))
+
+svm_params <- dep_models |> 
+    extract_workflow("base_svm") |> 
+  parameters() |> 
+  update(
+    cost = cost(),
+    rbf_sigma = dials::rbf_sigma())
+
+dep_models <- dep_models |> 
+  option_add(
+    param_info = lgbm_params,
+    id = "base_lgbm"
+  ) |> 
+  option_add(
+    param_info = xgb_params,
+    id = "base_xgb"
+  ) |> 
+  option_add(
+    param_info = svm_params,
+    id = "base_svm"
+  ) |> 
+   workflow_map("tune_grid", resamples = folds, grid = 11, 
+                metrics = metric_set(roc_auc), verbose = TRUE)
+
+rank_results(dep_models, rank_metric = "roc_auc", select_best = TRUE)                    
+
+autoplot(dep_models) +
+  geom_text(aes(y = mean -0.03, label= wflow_id), angle = 90, hjust = 1)+
+  theme(legend.position = "none")
+
+```
+
+## Hyperparameters and Feature Importance
+
+```{r }                   
+#| label: XGB Details
+#| warning: false
+#| message: false                   
+                   
+
+dep_models %>%
+  dplyr::filter(grepl("xgb", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_xgb") |> 
+  autoplot() +
+  labs(title = "XGB Hyperparameter Search")
+
+best_xgb_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("base_xgb") |> 
+  select_best(metric = "roc_auc")  
+  
+dep_models |> 
+  workflowsets::extract_workflow("base_xgb") |> 
+  finalize_workflow(best_xgb_params) |> 
+  fit(train_df) |> 
+  vip::vip(num_features = 30L)
+```
+
+
+```{r }                   
+#| label: lgbm Details
+#| warning: false
+#| message: false                   
+                                      
+
+
+dep_models %>%
+  dplyr::filter(grepl("lgbm", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_lgbm") |> 
+  autoplot() +
+  labs(title = "LGBM Hyperparameter Search")
+
+best_lgbm_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("base_lgbm") |> 
+  select_best(metric = "roc_auc")  
+  
+dep_models |> 
+  workflowsets::extract_workflow("base_lgbm") |> 
+  finalize_workflow(best_lgbm_params) |> 
+  fit(train_df) |> 
+  vip::vip(num_features = 30L)
+
+```
+
+
+```{r }                   
+#| label: svm Details
+#| warning: false
+#| message: false 
+                   
+dep_models %>%
+  dplyr::filter(grepl("svm", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+```
+
+
+```{r }                   
+#| label: pls Details
+#| warning: false
+#| message: false                    
+dep_models %>%
+  dplyr::filter(grepl("pls", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+```
+
+## Ensemble Stack                   
+
+```{r }                   
+#| label: Stack
+#| warning: false
+#| message: false 
+
+dep_stack <- stacks() %>%
+  add_candidates(dep_models) %>%
+  blend_predictions(  metric = metric_set(roc_auc),
+      penalty = c(10^seq(-1.7, -0.3, 0.1)),
+      non_negative = TRUE,
+      control = tune::control_grid(allow_par = TRUE))
+
+autoplot(dep_stack)
+autoplot(dep_stack, type = "weights")
+autoplot(dep_stack, type = "members")                   
+
+classification_fit <- dep_stack %>% 
+    fit_members()
+
+```
+
+# Performance {.tabset .tabset-fade .tabset-pills}
+
+## Submission
+```{r }                   
+#| label: submission
+#| warning: false
+#| message: false
+                   
+augment(classification_fit, train_df) %>% 
+  conf_mat(rainfall, .pred_class) %>%
+  yardstick:::autoplot.conf_mat(type = "heatmap")
+
+submit_df <-  augment(classification_fit , competition_df, type= "prob") %>%
+       transmute(id = round(id), rainfall = .pred_1)
+
+head(submit_df)  %>% 
+     knitr::kable()      
+
+submit_df  %>% 
+  write_csv("submission.csv")
+```  
