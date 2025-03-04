@@ -53,6 +53,7 @@ library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
 library(tidymodels) # metapackage see https://www.tidymodels.org/
 
 library(plsmod)
+library(discrim)
     
 library(bonsai)  
 library(stacks)
@@ -427,7 +428,7 @@ folds <- vfold_cv(train_df,
 
 boost_tree_lgbm_spec <- 
   boost_tree(
-    trees = 00L,
+    trees = 500L,
    tree_depth = tune(),
    learn_rate =  tune(),
    min_n = tune(),
@@ -463,17 +464,19 @@ pls_mixOmics_spec <-
   set_engine('mixOmics') %>%
   set_mode('classification')
 
+discrim_linear_mda_spec <-
+  discrim_linear(penalty = tune()) %>%
+  set_engine('mda')
+
 dep_models <- 
    workflow_set(
-      preproc = list(base = base_rec,
-                     base = base_rec,
-                     base = base_rec,
-                     base = base_rec),
+      preproc = list(base = base_rec),
       models = list(xgb = boost_tree_xgb_spec,
                     lgbm = boost_tree_lgbm_spec,
                     svm = svm_rbf_kernlab_spec,
-                    pls = pls_mixOmics_spec),
-      cross = FALSE
+                    pls = pls_mixOmics_spec,
+                    discrim = discrim_linear_mda_spec),
+      cross = TRUE
    ) %>% 
   option_add_parameters() |> 
   option_add(
@@ -616,6 +619,18 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
 ```
+
+```{r }                   
+#| label: discrim Details
+#| warning: false
+#| message: false                    
+dep_models %>%
+  dplyr::filter(grepl("discrim", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+```                   
 
 ## Ensemble Stack                   
 
