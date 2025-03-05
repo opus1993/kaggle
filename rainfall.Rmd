@@ -55,9 +55,10 @@ library(tidymodels) # metapackage see https://www.tidymodels.org/
 library(plsmod)
 library(discrim)
     
-library(bonsai)  
+library(bonsai)   # interface to lightgbm
+library(brulee)   # interface to torch
 library(stacks)
- # interface to lightgbm
+
 
 })
 
@@ -372,13 +373,14 @@ lagged_rec <- recipe(
                 starting_val = 10,
                 keep_original_cols = TRUE) |>                 
 
-  step_lag(temparature, mintemp, humidity, pressure) |> 
+  step_lag(temparature, mintemp, humidity, pressure, cloud) |> 
   
   step_impute_median(all_predictors()) |>      
 
   step_mutate(delta_humidity = lag_1_humidity - humidity,
               delta_pressure = lag_1_pressure - pressure,
-              delta_temperature = lag_1_temparature - temparature) |>
+              delta_temperature = lag_1_temparature - temparature,
+              delta_cloud = lag_1_cloud - cloud) |>
 
   step_zv(all_predictors()) %>%
   step_normalize(all_predictors())
@@ -462,6 +464,10 @@ discrim_linear_mda_spec <-
   discrim_linear(penalty = tune()) %>%
   set_engine('mda')
 
+logistic_reg_brulee_spec <-
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine('brulee')                   
+
 dep_models <- 
    workflow_set(
       preproc = list(base = base_rec,
@@ -470,7 +476,8 @@ dep_models <-
                     lgbm = boost_tree_lgbm_spec,
                     svm = svm_rbf_kernlab_spec,
                     pls = pls_mixOmics_spec,
-                    discrim = discrim_linear_mda_spec),
+                    discrim = discrim_linear_mda_spec,
+                    brulee = logistic_reg_brulee_spec),
       cross = TRUE
    ) %>% 
   option_add_parameters() |> 
@@ -730,7 +737,27 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
                    
-```                   
+```          
+
+```{r }                   
+#| label: brulee Details
+#| warning: false
+#| message: false                    
+dep_models %>%
+  dplyr::filter(grepl("base_brulee", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models %>%
+  dplyr::filter(grepl("lagged_brulee", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+                   
+```                     
 
 ## Ensemble Stack                   
 
