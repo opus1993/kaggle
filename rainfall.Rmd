@@ -133,65 +133,9 @@ competition_df <- all_df %>%
 ```
 
 
-
 # EDA {.tabset .tabset-fade .tabset-pills}
 
-## Time Series
-
-There is a seasonal component. 
-
-```{r}
-#| label: time series
-#| warning: false
-#| message: false
-#| fig.width: 6
-
-library(fable)
-library(feasts)
-library(fable.binary)
-
-train_df |> 
-  group_by(year, week = day %/% 7) |> 
-  summarize(rainfall = mean(rainfall == 1)) |> 
-  ggplot(aes(week, rainfall, color = factor(year), group = year)) +
-    geom_smooth(se = FALSE) +
-    scale_color_brewer(direction = 1)
-
-rainfall_ts <- train_df |> 
-  mutate(Date = as.Date("2010-01-01") + day + year*365, rainfall = rainfall == 1) |> 
-  select(Date, rainfall, sunshine, cloud) |> 
-  fable.binary::as_tsibble()
-
-rainfall_fit <- rainfall_ts |> 
-  model(
-        nn = BINNET(rainfall ~ fourier(K = 1, period = "year"))
-  ) 
-
-train_df <- train_df |> 
-  mutate(Date = as.Date("2010-01-01") + day + year*365) |> 
-  left_join(fitted(rainfall_fit), by = join_by(Date)) |> 
-  rename(seasonal_chance = .fitted) |> 
-  select(-Date, -.model)
-
-fc <- forecast(rainfall_fit, 
-               new_data =  competition_df |> 
-  mutate(Date = as.Date("2010-01-01") + day + year*365) |> 
-      select(Date, sunshine,cloud) |> 
-  fable.binary::as_tsibble(),
-               h = "2 years")
-
-as_tibble(fc) |>
-    ggplot(aes(x = Date, y = .mean, col = .model)) +
-    geom_line(show.legend = FALSE) +
-    labs(y = "Probability of rain")
-
-competition_df <- competition_df |> 
-  bind_cols(as_tibble(fc) |>  select(.mean)) |> 
-  rename(seasonal_chance = .mean) 
-
-```
-
-## Other Features
+## Features
 
 ```{r}
 #| label: Features
@@ -267,8 +211,24 @@ train_df %>%
   theme(panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
         plot.title.position = "plot") +
-  labs(color = NULL, fill = "Loan Status",
+  labs(color = NULL, fill = "Rainfall",
        title = "Numeric Feature Univariate Distributions",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+train_df %>% 
+  select(all_of(num_features), rainfall) %>% 
+  pivot_longer(-c(rainfall,day),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, day, color = rainfall)) +
+  geom_point(show.legend = FALSE) +
+   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.title.position = "plot") +
+  labs(color = NULL, fill = "Rainfall",
+       title = "Numeric Feature by Day",
        caption = "Data: Kaggle.com | Visual: Jim Gruman")
 
 ```
@@ -394,11 +354,21 @@ base_rec <- recipe(
     formula(paste0("rainfall ~ ", 
                str_c(features,  collapse = " + "))),
     data = train_df
+  ) %>%     
+
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+lagged_rec <- recipe(
+    
+    formula(paste0("rainfall ~ ", 
+               str_c(features,  collapse = " + "))),
+    data = train_df
   ) %>% 
 
   step_harmonic(winddirection, 
                 cycle_size = 300, 
-                frequency = 2,
+                frequency = c(2,5),
                 starting_val = 10,
                 keep_original_cols = TRUE) |>                 
 
@@ -408,11 +378,31 @@ base_rec <- recipe(
 
   step_zv(all_predictors()) %>%
   step_normalize(all_predictors())
+                  
 
 
-folds <- vfold_cv(train_df, 
-                  v = 13,
-                  strata = rainfall)                           
+folds <- rsample::sliding_period(
+  train_df |>   mutate(id = as.Date("2010-01-01") + day + year*365) ,
+  id,
+  period = "month",
+  lookback = 48L,
+  assess_start = 1L,
+  assess_stop = 3L,
+  complete = TRUE,
+  step = 3L,
+  skip = 0L
+)
+
+folds |>
+  tidy() |>
+  ggplot(aes(x = Resample, y = factor(Row), fill = Data)) +
+  geom_tile() +
+  labs(y = "Date") +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+                         
                                      
 ```
 
@@ -470,7 +460,8 @@ discrim_linear_mda_spec <-
 
 dep_models <- 
    workflow_set(
-      preproc = list(base = base_rec),
+      preproc = list(base = base_rec,
+                    lagged = lagged_rec),
       models = list(xgb = boost_tree_xgb_spec,
                     lgbm = boost_tree_lgbm_spec,
                     svm = svm_rbf_kernlab_spec,
@@ -505,6 +496,29 @@ svm_params <- dep_models |>
     cost = cost(),
     rbf_sigma = dials::rbf_sigma())
 
+xgb_lagged_params <- dep_models |> 
+  extract_workflow("lagged_xgb") |> 
+  parameters() |> 
+  update(min_n = min_n(range = c(10,120)),
+         learn_rate = learn_rate(range = c(-2,-1)))
+
+lgbm_lagged_params <- dep_models |> 
+  extract_workflow("lagged_lgbm") |> 
+  parameters() |> 
+  update(tree_depth = tree_depth(range = c(20,90)),
+         num_leaves = num_leaves(),
+         learn_rate = learn_rate(range = c(-2,-1)),
+          min_n = min_n(range = c(40,120)))
+
+svm_lagged_params <- dep_models |> 
+    extract_workflow("lagged_svm") |> 
+  parameters() |> 
+  update(
+    cost = cost(),
+    rbf_sigma = dials::rbf_sigma())
+
+                   
+
 dep_models <- dep_models |> 
   option_add(
     param_info = lgbm_params,
@@ -517,6 +531,18 @@ dep_models <- dep_models |>
   option_add(
     param_info = svm_params,
     id = "base_svm"
+  ) |> 
+  option_add(
+    param_info = lgbm_lagged_params,
+    id = "lagged_lgbm"
+  ) |> 
+  option_add(
+    param_info = xgb_lagged_params,
+    id = "lagged_xgb"
+  ) |> 
+  option_add(
+    param_info = svm_lagged_params,
+    id = "lagged_svm"
   ) |> 
    workflow_map("tune_grid", resamples = folds, grid = 11, 
                 metrics = metric_set(roc_auc), verbose = TRUE)
@@ -538,7 +564,7 @@ autoplot(dep_models) +
                    
 
 dep_models %>%
-  dplyr::filter(grepl("xgb", wflow_id)) %>%
+  dplyr::filter(grepl("base_xgb", wflow_id)) %>%
   dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
   dplyr::select(wflow_id, metrics) %>%
   tidyr::unnest(cols = metrics) |> 
@@ -558,6 +584,29 @@ dep_models |>
   finalize_workflow(best_xgb_params) |> 
   fit(train_df) |> 
   vip::vip(num_features = 30L)
+
+dep_models %>%
+  dplyr::filter(grepl("lagged_xgb", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models |> 
+  workflowsets::extract_workflow_set_result("lagged_xgb") |> 
+  autoplot() +
+  labs(title = "Lagged XGB Hyperparameter Search")
+
+best_xgb_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("lagged_xgb") |> 
+  select_best(metric = "roc_auc")  
+  
+dep_models |> 
+  workflowsets::extract_workflow("lagged_xgb") |> 
+  finalize_workflow(best_xgb_params) |> 
+  fit(train_df) |> 
+  vip::vip(num_features = 30L)
+                   
 ```
 
 
@@ -569,7 +618,7 @@ dep_models |>
 
 
 dep_models %>%
-  dplyr::filter(grepl("lgbm", wflow_id)) %>%
+  dplyr::filter(grepl("base_lgbm", wflow_id)) %>%
   dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
   dplyr::select(wflow_id, metrics) %>%
   tidyr::unnest(cols = metrics) |> 
@@ -590,6 +639,29 @@ dep_models |>
   fit(train_df) |> 
   vip::vip(num_features = 30L)
 
+dep_models %>%
+  dplyr::filter(grepl("lagged_lgbm", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models |> 
+  workflowsets::extract_workflow_set_result("lagged_lgbm") |> 
+  autoplot() +
+  labs(title = "Lagged LGBM Hyperparameter Search")
+
+best_lgbm_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("lagged_lgbm") |> 
+  select_best(metric = "roc_auc")  
+  
+dep_models |> 
+  workflowsets::extract_workflow("lagged_lgbm") |> 
+  finalize_workflow(best_lgbm_params) |> 
+  fit(train_df) |> 
+  vip::vip(num_features = 30L)
+
+                   
 ```
 
 
@@ -599,11 +671,19 @@ dep_models |>
 #| message: false 
                    
 dep_models %>%
-  dplyr::filter(grepl("svm", wflow_id)) %>%
+  dplyr::filter(grepl("base_svm", wflow_id)) %>%
   dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
   dplyr::select(wflow_id, metrics) %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
+
+dep_models %>%
+  dplyr::filter(grepl("lagged_svm", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+                   
 
 ```
 
@@ -613,11 +693,19 @@ dep_models %>%
 #| warning: false
 #| message: false                    
 dep_models %>%
-  dplyr::filter(grepl("pls", wflow_id)) %>%
+  dplyr::filter(grepl("base_pls", wflow_id)) %>%
   dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
   dplyr::select(wflow_id, metrics) %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
+
+dep_models %>%
+  dplyr::filter(grepl("lagged_pls", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+                   
 ```
 
 ```{r }                   
@@ -625,11 +713,19 @@ dep_models %>%
 #| warning: false
 #| message: false                    
 dep_models %>%
-  dplyr::filter(grepl("discrim", wflow_id)) %>%
+  dplyr::filter(grepl("base_discrim", wflow_id)) %>%
   dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
   dplyr::select(wflow_id, metrics) %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
+
+dep_models %>%
+  dplyr::filter(grepl("lagged_discrim", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+                   
 ```                   
 
 ## Ensemble Stack                   
