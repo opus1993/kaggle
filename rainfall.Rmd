@@ -391,14 +391,14 @@ folds <- rsample::sliding_period(
   train_df |>   mutate(id = as.Date("2010-01-01") + day + year*365) ,
   id,
   period = "month",
-  lookback = 48L,
+  lookback = 36L,
   assess_start = 1L,
-  assess_stop = 3L,
+  assess_stop = 6L,
   complete = TRUE,
-  step = 3L,
+  step = 6L,
   skip = 0L
 )
-
+                   
 folds |>
   tidy() |>
   ggplot(aes(x = Resample, y = factor(Row), fill = Data)) +
@@ -462,11 +462,13 @@ pls_mixOmics_spec <-
 
 discrim_linear_mda_spec <-
   discrim_linear(penalty = tune()) %>%
-  set_engine('mda')
+  set_engine('mda')  %>%
+  set_mode('classification')
 
 logistic_reg_brulee_spec <-
-  logistic_reg(penalty = tune(), mixture = tune()) %>%
-  set_engine('brulee')                   
+  mlp(penalty = tune(), epochs = tune()) %>%
+  set_engine('brulee')   %>%
+  set_mode('classification')                 
 
 dep_models <- 
    workflow_set(
