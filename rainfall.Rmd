@@ -221,8 +221,8 @@ train_df %>%
     names_to = "metric",
     values_to = "value"
   ) %>%
-  ggplot(aes(value, day, color = rainfall)) +
-  geom_point(show.legend = FALSE) +
+  ggplot(aes(day, value, color = rainfall)) +
+  geom_point(show.legend = FALSE, shape = 20) +
    facet_wrap(vars(metric), scales = "free", ncol = 2) +
   theme(panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
@@ -372,9 +372,13 @@ lagged_rec <- recipe(
                 starting_val = 10,
                 keep_original_cols = TRUE) |>                 
 
-  step_lag(temparature, mintemp, humidity) |> 
+  step_lag(temparature, mintemp, humidity, pressure) |> 
   
-  step_impute_median(all_predictors()) |>                  
+  step_impute_median(all_predictors()) |>      
+
+  step_mutate(delta_humidity = lag_1_humidity - humidity,
+              delta_pressure = lag_1_pressure - pressure,
+              delta_temperature = lag_1_temparature - temparature) |>
 
   step_zv(all_predictors()) %>%
   step_normalize(all_predictors())
