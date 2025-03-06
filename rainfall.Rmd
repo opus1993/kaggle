@@ -468,7 +468,12 @@ discrim_linear_mda_spec <-
 logistic_reg_brulee_spec <-
   mlp(penalty = tune(), epochs = tune()) %>%
   set_engine('brulee')   %>%
-  set_mode('classification')                 
+  set_mode('classification')     
+
+rand_forest <-
+  rand_forest() %>%
+  set_engine(engine = "partykit") %>%
+  set_mode(mode = "classification")                
 
 dep_models <- 
    workflow_set(
@@ -479,7 +484,8 @@ dep_models <-
                     svm = svm_rbf_kernlab_spec,
                     pls = pls_mixOmics_spec,
                     discrim = discrim_linear_mda_spec,
-                    brulee = logistic_reg_brulee_spec),
+                    brulee = logistic_reg_brulee_spec,
+                    forest = rand_forest),
       cross = TRUE
    ) %>% 
   option_add_parameters() |> 
@@ -557,7 +563,7 @@ dep_models <- dep_models |>
     param_info = svm_lagged_params,
     id = "lagged_svm"
   ) |> 
-   workflow_map("tune_grid", resamples = folds, grid = 11, 
+   workflow_map("tune_grid", resamples = folds, grid = 25, 
                 metrics = metric_set(roc_auc), verbose = TRUE)
 
 rank_results(dep_models, rank_metric = "roc_auc", select_best = TRUE)                    
@@ -759,7 +765,27 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
                    
-```                     
+```
+
+```{r }                   
+#| label: random forest Details
+#| warning: false
+#| message: false                    
+dep_models %>%
+  dplyr::filter(grepl("base_forest", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+
+dep_models %>%
+  dplyr::filter(grepl("lagged_forest", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
+                   
+```                    
 
 ## Ensemble Stack                   
 
