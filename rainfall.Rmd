@@ -35,10 +35,12 @@ In addition to `tidymodels` we will load the `bonsai` interface to lightgbm.
 if (dir.exists("/kaggle")){
   path <- "/kaggle/input/playground-series-s5e3/"
 
-options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
-remotes::install_github("tidyverts/fable.binary", quiet = TRUE)
-remotes::install_github("tidymodels/plsmod", quiet = TRUE)    
+# options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/focal/2021-05-17"))
+# install.packages("ranger", quiet = TRUE)
     
+options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
+remotes::install_github("tidymodels/plsmod", quiet = TRUE)    
+remotes::install_github("mayer79/outForest", quiet = TRUE)    
 cores <- future::availableCores()
 
 } else {
@@ -55,14 +57,12 @@ library(tidymodels) # metapackage see https://www.tidymodels.org/
 library(plsmod)
 library(discrim)
     
-library(bonsai)   # interface to lightgbm
 library(brulee)   # interface to torch
-library(stacks)
-
 
 })
 
 tidymodels_prefer()
+conflicted::conflicts_prefer(brulee::coef)
 
 options(tidymodels.dark = TRUE)
 
@@ -82,11 +82,18 @@ preprocessor <- function(dataframe) {
 
 dataframe <- dataframe %>%
     janitor::clean_names() |>
+
+
+    group_by(week = id %/% 7) |> 
+    mutate(across(c(where(is.numeric), -day), \(x) mean(x, na.rm = TRUE),  .names = "week_mean_{.col}")) |>
+    ungroup() |>
   
+    select(-week) |>
+
     mutate(year = id %/% 365 ,
            day = id - year * 365 ) |> 
-
-    mutate(across(c(where(is.character)), ~ as.factor(.x))) 
+   
+    mutate(across(c(where(is.character)), \(x) as.factor(x))) 
 
 return(dataframe)
 }
@@ -146,7 +153,7 @@ competition_df <- all_df %>%
 
 
 features <- train_df %>%
-  select(-id, -rainfall) |> 
+  select(-id, -rainfall, -day, -year) |> 
   names()
 
 train_df <- train_df %>% 
@@ -217,7 +224,7 @@ train_df %>%
        caption = "Data: Kaggle.com | Visual: Jim Gruman")
 
 train_df %>% 
-  select(all_of(num_features), rainfall) %>% 
+  select(all_of(num_features), rainfall, day) %>% 
   pivot_longer(-c(rainfall,day),
     names_to = "metric",
     values_to = "value"
@@ -302,9 +309,63 @@ bind_rows(train_df %>% mutate(source = "train"),
                
 
 ```
+
+## Pairwise Correlations
                    
+`ggcorrplot` provides a quick look at numeric features where the correlation may be significant. 
+
+```{r}
+#| label: pairwise correlations
+
+train_df %>% 
+  select(all_of(num_features)) %>% 
+  ggcorrplot::cor_pmat() %>% 
+  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,
+    type = "lower", insig = "blank") +
+  labs(title = "Pairwise Correlations Training Set")
+                   
+competition_df %>% 
+  select(all_of(num_features)) %>% 
+  ggcorrplot::cor_pmat() %>% 
+  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,
+    type = "lower", insig = "blank") +
+  labs(title = "Pairwise Correlations Competition Set")
+
+```                    
+
+## Outforest
+
+`outForest` is a multivariate anomaly detection method. Each numeric variable is regressed onto all other variables using a random forest. If the scaled absolute difference between observed value and out-of-bag prediction is larger than a prespecified threshold, then a value is considered an outlier.
+
+A benefit of this technique is noise reduction, at least at the 2 percent most anomylous observations.  A drawback is of applying it at this point to the training data and the cross validation folds is that the CV out of sample estimates of error are smaller than we would see with raw.
+                   
+Computationally, it is faster to run it here.                   
+
+```{r}
+#| label: outforest anomaly detection and interpolation
 
 
+                   
+outforest_model <- outForest::outForest(
+  data = train_df,
+  formula =  formula(paste0(str_c(features,  collapse = " + "), "~ rainfall")),
+  max_prop_outliers = 0.02,
+  threshold = 3,
+  impute_multivariate_control = list(
+    pmm.k = 3L,
+    num.trees = 250L,
+    maxiter = 3L
+  ),
+  allow_predictions = TRUE
+)
+
+plot(outforest_model)
+
+outforest_preds <- predict(outforest_model, newdata = raw_df)
+
+train_df <- outForest::Data(outforest_preds) %>% as_tibble()
+
+``` 
 
 ## Target
 
@@ -358,7 +419,8 @@ base_rec <- recipe(
   ) %>%     
 
   step_zv(all_predictors()) %>%
-  step_normalize(all_predictors())
+  step_normalize(all_predictors()) |> 
+  themis::step_upsample(rainfall,over_ratio = 1)
 
 lagged_rec <- recipe(
     
@@ -377,13 +439,11 @@ lagged_rec <- recipe(
   
   step_impute_median(all_predictors()) |>      
 
-  step_mutate(delta_humidity = lag_1_humidity - humidity,
-              delta_pressure = lag_1_pressure - pressure,
-              delta_temperature = lag_1_temparature - temparature,
-              delta_cloud = lag_1_cloud - cloud) |>
+  step_mutate(delta_pressure = lag_1_pressure - pressure) |>
 
   step_zv(all_predictors()) %>%
-  step_normalize(all_predictors())
+  step_normalize(all_predictors()) |> 
+  themis::step_upsample(rainfall,over_ratio = 1)
                   
 
 
@@ -422,39 +482,16 @@ folds |>
 #| message: false
 #| fig.width: 12
 
-boost_tree_lgbm_spec <- 
-  boost_tree(
-    trees = 500L,
-   tree_depth = tune(),
-   learn_rate =  tune(),
-   min_n = tune(),
-   sample_size = 0.85
-#   mtry = tune(),
-#   loss_reduction = 9e-9
-  ) %>% 
-  set_engine(engine = "lightgbm",
-             is_unbalance = TRUE,
-             num_leaves = tune(),
-             num_threads = cores
-       #      boosting = "goss"   # this may slow the runtime
-             ) %>%
-  set_mode(mode = "classification") 
 
-boost_tree_xgb_spec <- 
-  boost_tree(
-    trees = 500L,
-    min_n = tune(),
-    learn_rate = tune(),
-   sample_size = 0.85
-  ) %>% 
-  set_engine(engine = "xgboost", nthread = cores) %>%
-  set_mode(mode = "classification")        
+logistic_reg_glmnet_spec <-
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine('glmnet')
 
 svm_rbf_kernlab_spec <-
   svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
   set_engine('kernlab') %>%
   set_mode('classification')
-
+                   
 pls_mixOmics_spec <-
   pls(predictor_prop = tune(), num_comp = tune()) %>%
   set_engine('mixOmics') %>%
@@ -469,101 +506,74 @@ logistic_reg_brulee_spec <-
   mlp(penalty = tune(), epochs = tune()) %>%
   set_engine('brulee')   %>%
   set_mode('classification')     
-
-rand_forest <-
-  rand_forest() %>%
-  set_engine(engine = "partykit") %>%
-  set_mode(mode = "classification")                
+          
 
 dep_models <- 
    workflow_set(
       preproc = list(base = base_rec,
                     lagged = lagged_rec),
-      models = list(xgb = boost_tree_xgb_spec,
-                    lgbm = boost_tree_lgbm_spec,
+      models = list(linear = logistic_reg_glmnet_spec,
                     svm = svm_rbf_kernlab_spec,
                     pls = pls_mixOmics_spec,
                     discrim = discrim_linear_mda_spec,
-                    brulee = logistic_reg_brulee_spec,
-                    forest = rand_forest),
+                    brulee = logistic_reg_brulee_spec),
       cross = TRUE
    ) %>% 
   option_add_parameters() |> 
   option_add(
-    control = control_stack_grid(),
+    control = stacks::control_stack_grid(),
     metrics = metric_set(mn_log_loss)
   )
+
+glm_params <- dep_models |> 
+    extract_workflow("base_linear") |> 
+  parameters() |> 
+  update(
+    mixture = mixture(),
+    penalty = dials::penalty(range = c(-1,0)))
+
+glm_lagged_params <- dep_models |> 
+    extract_workflow("lagged_linear") |> 
+  parameters() |> 
+  update(
+    mixture = mixture(),
+    penalty = dials::penalty(range = c(-1,0)))
                    
-xgb_params <- dep_models |> 
-  extract_workflow("base_xgb") |> 
-  parameters() |> 
-  update(min_n = min_n(range = c(10,120)),
-         learn_rate = learn_rate(range = c(-2,-1)))
-
-lgbm_params <- dep_models |> 
-  extract_workflow("base_lgbm") |> 
-  parameters() |> 
-  update(tree_depth = tree_depth(range = c(20,90)),
-         num_leaves = num_leaves(),
-         learn_rate = learn_rate(range = c(-2,-1)),
-          min_n = min_n(range = c(40,120)))
-
+                   
 svm_params <- dep_models |> 
     extract_workflow("base_svm") |> 
   parameters() |> 
   update(
     cost = cost(),
-    rbf_sigma = dials::rbf_sigma())
-
-xgb_lagged_params <- dep_models |> 
-  extract_workflow("lagged_xgb") |> 
-  parameters() |> 
-  update(min_n = min_n(range = c(10,120)),
-         learn_rate = learn_rate(range = c(-2,-1)))
-
-lgbm_lagged_params <- dep_models |> 
-  extract_workflow("lagged_lgbm") |> 
-  parameters() |> 
-  update(tree_depth = tree_depth(range = c(20,90)),
-         num_leaves = num_leaves(),
-         learn_rate = learn_rate(range = c(-2,-1)),
-          min_n = min_n(range = c(40,120)))
+    rbf_sigma = dials::rbf_sigma(range = c(-4,-8)))
 
 svm_lagged_params <- dep_models |> 
     extract_workflow("lagged_svm") |> 
   parameters() |> 
   update(
     cost = cost(),
-    rbf_sigma = dials::rbf_sigma())
+    rbf_sigma = dials::rbf_sigma(range = c(-4,-8)))
 
                    
 
 dep_models <- dep_models |> 
   option_add(
-    param_info = lgbm_params,
-    id = "base_lgbm"
-  ) |> 
-  option_add(
-    param_info = xgb_params,
-    id = "base_xgb"
-  ) |> 
-  option_add(
     param_info = svm_params,
     id = "base_svm"
-  ) |> 
-  option_add(
-    param_info = lgbm_lagged_params,
-    id = "lagged_lgbm"
-  ) |> 
-  option_add(
-    param_info = xgb_lagged_params,
-    id = "lagged_xgb"
   ) |> 
   option_add(
     param_info = svm_lagged_params,
     id = "lagged_svm"
   ) |> 
-   workflow_map("tune_grid", resamples = folds, grid = 25, 
+  option_add(
+    param_info = glm_params,
+    id = "base_linear"
+  ) |> 
+  option_add(
+    param_info = glm_lagged_params,
+    id = "lagged_linear"
+  ) |> 
+   workflow_map("tune_grid", resamples = folds, grid = 5, 
                 metrics = metric_set(roc_auc), verbose = TRUE)
 
 rank_results(dep_models, rank_metric = "roc_auc", select_best = TRUE)                    
@@ -577,113 +587,60 @@ autoplot(dep_models) +
 ## Hyperparameters and Feature Importance
 
 ```{r }                   
-#| label: XGB Details
+#| label: linear Details
 #| warning: false
 #| message: false                   
                    
 
 dep_models %>%
-  dplyr::filter(grepl("base_xgb", wflow_id)) %>%
+  dplyr::filter(grepl("base_linear", wflow_id)) %>%
   dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
   dplyr::select(wflow_id, metrics) %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
 
 dep_models |> 
-  workflowsets::extract_workflow_set_result("base_xgb") |> 
+  workflowsets::extract_workflow_set_result("base_linear") |> 
   autoplot() +
-  labs(title = "XGB Hyperparameter Search")
+  labs(title = "GLMNET Hyperparameter Search")
 
-best_xgb_params <- dep_models |> 
-  workflowsets::extract_workflow_set_result("base_xgb") |> 
+best_linear_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("base_linear") |> 
   select_best(metric = "roc_auc")  
-  
-dep_models |> 
-  workflowsets::extract_workflow("base_xgb") |> 
-  finalize_workflow(best_xgb_params) |> 
-  fit(train_df) |> 
-  vip::vip(num_features = 30L)
 
+dep_models |> 
+  workflowsets::extract_workflow("base_linear") |> 
+  finalize_workflow(best_linear_params) |> 
+  fit(train_df) |> 
+  vip::vip(num_features = 30L)                   
+                   
+  
 dep_models %>%
-  dplyr::filter(grepl("lagged_xgb", wflow_id)) %>%
+  dplyr::filter(grepl("lagged_linear", wflow_id)) %>%
   dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
   dplyr::select(wflow_id, metrics) %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
 
 dep_models |> 
-  workflowsets::extract_workflow_set_result("lagged_xgb") |> 
+  workflowsets::extract_workflow_set_result("lagged_linear") |> 
   autoplot() +
-  labs(title = "Lagged XGB Hyperparameter Search")
+  labs(title = "GLMNET Hyperparameter Search")
 
-best_xgb_params <- dep_models |> 
-  workflowsets::extract_workflow_set_result("lagged_xgb") |> 
+best_linear_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("lagged_linear") |> 
   select_best(metric = "roc_auc")  
-  
+
 dep_models |> 
-  workflowsets::extract_workflow("lagged_xgb") |> 
-  finalize_workflow(best_xgb_params) |> 
+  workflowsets::extract_workflow("lagged_linear") |> 
+  finalize_workflow(best_linear_params) |> 
   fit(train_df) |> 
-  vip::vip(num_features = 30L)
+  vip::vip(num_features = 30L)                   
+                   
                    
 ```
 
-
-```{r }                   
-#| label: lgbm Details
-#| warning: false
-#| message: false                   
-                                      
-
-
-dep_models %>%
-  dplyr::filter(grepl("base_lgbm", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
-
-dep_models |> 
-  workflowsets::extract_workflow_set_result("base_lgbm") |> 
-  autoplot() +
-  labs(title = "LGBM Hyperparameter Search")
-
-best_lgbm_params <- dep_models |> 
-  workflowsets::extract_workflow_set_result("base_lgbm") |> 
-  select_best(metric = "roc_auc")  
-  
-dep_models |> 
-  workflowsets::extract_workflow("base_lgbm") |> 
-  finalize_workflow(best_lgbm_params) |> 
-  fit(train_df) |> 
-  vip::vip(num_features = 30L)
-
-dep_models %>%
-  dplyr::filter(grepl("lagged_lgbm", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
-
-dep_models |> 
-  workflowsets::extract_workflow_set_result("lagged_lgbm") |> 
-  autoplot() +
-  labs(title = "Lagged LGBM Hyperparameter Search")
-
-best_lgbm_params <- dep_models |> 
-  workflowsets::extract_workflow_set_result("lagged_lgbm") |> 
-  select_best(metric = "roc_auc")  
-  
-dep_models |> 
-  workflowsets::extract_workflow("lagged_lgbm") |> 
-  finalize_workflow(best_lgbm_params) |> 
-  fit(train_df) |> 
-  vip::vip(num_features = 30L)
-
                    
-```
-
-
 ```{r }                   
 #| label: svm Details
 #| warning: false
@@ -765,48 +722,38 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
                    
-```
+```           
+
+## Select Best                
 
 ```{r }                   
-#| label: random forest Details
-#| warning: false
-#| message: false                    
-dep_models %>%
-  dplyr::filter(grepl("base_forest", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
-
-dep_models %>%
-  dplyr::filter(grepl("lagged_forest", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
-                   
-```                    
-
-## Ensemble Stack                   
-
-```{r }                   
-#| label: Stack
+#| label: Best Model fit
 #| warning: false
 #| message: false 
 
-dep_stack <- stacks() %>%
-  add_candidates(dep_models) %>%
-  blend_predictions(  metric = metric_set(roc_auc),
-      penalty = c(10^seq(-1.7, -0.3, 0.1)),
-      non_negative = TRUE,
-      control = tune::control_grid(allow_par = TRUE))
+best_model_id <- dep_models |> 
+  rank_results(
+    rank_metric = "roc_auc",
+    select_best = TRUE
+  ) |> 
+  head(1) |> 
+  pull(wflow_id)
 
-autoplot(dep_stack)
-autoplot(dep_stack, type = "weights")
-autoplot(dep_stack, type = "members")                   
+best_model_id
 
-classification_fit <- dep_stack %>% 
-    fit_members()
+best_model <- extract_workflow(dep_models, id = best_model_id)
+
+best_workflow <- 
+  dep_models |> 
+  extract_workflow_set_result(id = best_model_id)
+
+best_workflow                   
+
+select_best(best_workflow, metric =   "roc_auc")
+
+final_wf <- finalize_workflow(best_model, select_best(best_workflow,  metric =   "roc_auc"))
+                 
+classification_fit <- fit(final_wf, data = train_df)
 
 ```
 
@@ -821,7 +768,11 @@ classification_fit <- dep_stack %>%
 augment(classification_fit, train_df) %>% 
   conf_mat(rainfall, .pred_class) %>%
   yardstick:::autoplot.conf_mat(type = "heatmap")
-
+                   
+augment(classification_fit, train_df, type = "prob") %>%
+    yardstick::roc_curve(rainfall, .pred_0) %>% 
+    autoplot()
+                   
 submit_df <-  augment(classification_fit , competition_df, type= "prob") %>%
        transmute(id = round(id), rainfall = .pred_1)
 
