@@ -85,7 +85,7 @@ dataframe <- dataframe %>%
 
 
     group_by(week = id %/% 7) |> 
-    mutate(across(c(where(is.numeric), -day), \(x) mean(x, na.rm = TRUE),  .names = "week_mean_{.col}")) |>
+    mutate(across(c(where(is.numeric), -day, -id), \(x) mean(x, na.rm = TRUE),  .names = "week_mean_{.col}")) |>
     ungroup() |>
   
     select(-week) |>
@@ -316,7 +316,8 @@ bind_rows(train_df %>% mutate(source = "train"),
 
 ```{r}
 #| label: pairwise correlations
-
+#| fig.width: 12
+                   
 train_df %>% 
   select(all_of(num_features)) %>% 
   ggcorrplot::cor_pmat() %>% 
@@ -339,11 +340,11 @@ competition_df %>%
 
 A benefit of this technique is noise reduction, at least at the 2 percent most anomylous observations.  A drawback is of applying it at this point to the training data and the cross validation folds is that the CV out of sample estimates of error are smaller than we would see with raw.
                    
-Computationally, it is faster to run it here.                   
+Computationally, it is faster to run it here. The method relies on the `ranger`                    
 
 ```{r}
 #| label: outforest anomaly detection and interpolation
-
+#| fig.width: 12
 
                    
 outforest_model <- outForest::outForest(
@@ -361,7 +362,7 @@ outforest_model <- outForest::outForest(
 
 plot(outforest_model)
 
-outforest_preds <- predict(outforest_model, newdata = raw_df)
+outforest_preds <- predict(outforest_model, newdata = train_df)
 
 train_df <- outForest::Data(outforest_preds) %>% as_tibble()
 
@@ -770,8 +771,11 @@ augment(classification_fit, train_df) %>%
   yardstick:::autoplot.conf_mat(type = "heatmap")
                    
 augment(classification_fit, train_df, type = "prob") %>%
-    yardstick::roc_curve(rainfall, .pred_0) %>% 
-    autoplot()
+    yardstick::roc_curve(rainfall, .pred_0) |> 
+    ggplot(aes(1-specificity, sensitivity)) +
+    geom_line() +
+    geom_abline(slope = 1) +
+    coord_equal() 
                    
 submit_df <-  augment(classification_fit , competition_df, type= "prob") %>%
        transmute(id = round(id), rainfall = .pred_1)
