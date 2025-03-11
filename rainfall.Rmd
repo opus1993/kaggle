@@ -25,8 +25,6 @@ The Kaggle kernels have many of the common r packages built in.
 
 ## Load libraries
 
-In addition to `tidymodels` we will load the `bonsai` interface to lightgbm.
-
 ```{r }
 #| label: setup
 #| warning: false
@@ -41,19 +39,25 @@ if (dir.exists("/kaggle")){
 options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
 remotes::install_github("tidymodels/plsmod", quiet = TRUE)    
 remotes::install_github("mayer79/outForest", quiet = TRUE)    
+remotes::install_github("tidyverts/fable.binary")
+    
 cores <- future::availableCores()
 
 } else {
   path <- stringr::str_c(here::here("data"),"/")
   orig_path <- stringr::str_c(here::here("data"),"/")
 
-  cores <- future::availableCores(omit = 7)
+  cores <- future::availableCores(omit = 2)
 }
  
 suppressPackageStartupMessages({
 library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
 library(tidymodels) # metapackage see https://www.tidymodels.org/
 
+library(fable)
+library(feasts)
+library(fable.binary)
+    
 library(plsmod)
 library(discrim)
     
@@ -85,10 +89,12 @@ dataframe <- dataframe %>%
 
 
     group_by(week = id %/% 7) |> 
-    mutate(across(c(where(is.numeric), -day, -id), \(x) mean(x, na.rm = TRUE),  .names = "week_mean_{.col}")) |>
+    mutate(across(c(where(is.numeric), -day, -id, -winddirection), \(x) mean(x, na.rm = TRUE),  .names = "week_mean_{.col}")) |>
     ungroup() |>
   
     select(-week) |>
+
+    mutate(winddirection = factor(winddirection %/% 10)) |> 
 
     mutate(year = id %/% 365 ,
            day = id - year * 365 ) |> 
@@ -241,6 +247,79 @@ train_df %>%
 
 ```
 
+## Nominal features
+
+Explore the distribution of outcome class by factor level.
+
+
+```{r}
+#| label: nominal
+#| warning: false
+#| message: false
+#| fig.height: 24
+#| fig.width: 12
+
+
+if(length(nom_features) >0){
+
+train_df %>% 
+  select(all_of(nom_features), rainfall) %>% 
+  mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%
+
+  pivot_longer(-rainfall,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+    
+  summarise(n = n(),
+            .by = c(rainfall, metric, value)) %>%
+
+  mutate(value = tidytext::reorder_within(value, n, metric)) %>%
+    
+  ggplot(aes(x = n, y = value, fill = rainfall)) +
+  geom_col() +
+
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+       legend.position = "bottom") +
+  labs(title = "Nominal Feature Counts",
+       fill = NULL,
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+  
+
+
+train_df %>% 
+  select(all_of(nom_features), rainfall) %>% 
+  mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%
+
+  pivot_longer(-rainfall,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+    
+  summarise(n = n(),
+            .by = c(rainfall, metric, value)) %>%
+
+  mutate(value = tidytext::reorder_within(value, n, metric)) %>%
+    
+  ggplot(aes(x = n, y = value, fill = rainfall)) +
+  geom_col(position = "fill") +
+
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+       legend.position = "bottom") +
+  labs(title = "Proportion of Outcome in Nominal Feature Counts",
+       fill = NULL,
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+}    
+```
 
 
 ## Counts of Missingness
@@ -317,6 +396,7 @@ bind_rows(train_df %>% mutate(source = "train"),
 ```{r}
 #| label: pairwise correlations
 #| fig.width: 12
+#| fig.height: 12                   
                    
 train_df %>% 
   select(all_of(num_features)) %>% 
@@ -338,19 +418,20 @@ competition_df %>%
 
 `outForest` is a multivariate anomaly detection method. Each numeric variable is regressed onto all other variables using a random forest. If the scaled absolute difference between observed value and out-of-bag prediction is larger than a prespecified threshold, then a value is considered an outlier.
 
-A benefit of this technique is noise reduction, at least at the 2 percent most anomylous observations.  A drawback is of applying it at this point to the training data and the cross validation folds is that the CV out of sample estimates of error are smaller than we would see with raw.
+A benefit of this technique is noise reduction, at least at the 1 percent most anomylous observations.  A drawback is of applying it at this point to the training data and the cross validation folds is that the CV out of sample estimates of error are smaller than we would see with raw.
                    
-Computationally, it is faster to run it here. The method relies on the `ranger`                    
+Computationally, it is faster to run it here. The method relies on the `ranger` package.                 
 
 ```{r}
 #| label: outforest anomaly detection and interpolation
 #| fig.width: 12
+#| fig.height: 12    
 
                    
 outforest_model <- outForest::outForest(
   data = train_df,
   formula =  formula(paste0(str_c(features,  collapse = " + "), "~ rainfall")),
-  max_prop_outliers = 0.02,
+  max_prop_outliers = 0.01,
   threshold = 3,
   impute_multivariate_control = list(
     pmm.k = 3L,
@@ -366,7 +447,48 @@ outforest_preds <- predict(outforest_model, newdata = train_df)
 
 train_df <- outForest::Data(outforest_preds) %>% as_tibble()
 
-``` 
+```
+
+## Time Series
+                   
+```{r}
+#| label: time series
+#| fig.width: 12
+#| fig.height: 6 
+                   
+rainfall_ts <- train_df |> 
+  mutate(Date = as.Date("2010-01-01") + day + year*365, rainfall = rainfall == 1) |> 
+  select(Date, rainfall, all_of(num_features)) |> 
+  fable.binary::as_tsibble()
+
+rainfall_fit <- rainfall_ts |> 
+  model(
+        nn = BINNET(formula(paste0("rainfall ~ ", 
+               str_c(num_features,  collapse = " + "))))
+  ) 
+
+train_df <- train_df |> 
+  bind_cols(fitted(rainfall_fit) |> select(.fitted)) |> 
+  rename(seasonal_chance = .fitted) |> 
+  select(-Date)
+
+fc <- forecast(rainfall_fit, new_data = competition_df |> 
+                   mutate(Date = as.Date("2010-01-01") + day + year*365) |> 
+                   fable.binary::as_tsibble()
+               )
+
+as_tibble(fc) |>
+    ggplot(aes(x = Date, y = .mean, col = .model)) +
+    geom_line(show.legend = FALSE) +
+    labs(y = "Probability of rain")
+
+competition_df <- competition_df |> 
+  bind_cols(as_tibble(fc) |>  select(.mean)) |> 
+  rename(seasonal_chance = .mean)       
+
+features <- c(features, "seasonal_chance")                              
+```                   
+                   
 
 ## Target
 
@@ -418,7 +540,12 @@ base_rec <- recipe(
                str_c(features,  collapse = " + "))),
     data = train_df
   ) %>%     
+                   
+  step_mutate(cloud_o_sunshine = cloud / (sunshine + 1)) |>   
 
+  step_impute_mode(all_nominal_predictors()) |>                    
+  step_dummy(all_nominal_predictors()) |>     
+                   
   step_zv(all_predictors()) %>%
   step_normalize(all_predictors()) |> 
   themis::step_upsample(rainfall,over_ratio = 1)
@@ -430,17 +557,17 @@ lagged_rec <- recipe(
     data = train_df
   ) %>% 
 
-  step_harmonic(winddirection, 
-                cycle_size = 300, 
-                frequency = c(2,5),
-                starting_val = 10,
-                keep_original_cols = TRUE) |>                 
+#  step_discretize(winddirection, 
+#                  num_breaks = 6,
+#                  min_unique = 1) |>     
+  step_impute_mode(all_nominal_predictors()) |> 
+  step_dummy(all_nominal_predictors()) |>                    
 
-  step_lag(temparature, mintemp, humidity, pressure, cloud) |> 
+  step_lag(mintemp) |> 
   
   step_impute_median(all_predictors()) |>      
 
-  step_mutate(delta_pressure = lag_1_pressure - pressure) |>
+  step_mutate(cloud_o_sunshine = cloud / (sunshine + 1)) |>   
 
   step_zv(all_predictors()) %>%
   step_normalize(all_predictors()) |> 
@@ -503,8 +630,8 @@ discrim_linear_mda_spec <-
   set_engine('mda')  %>%
   set_mode('classification')
 
-logistic_reg_brulee_spec <-
-  mlp(penalty = tune(), epochs = tune()) %>%
+brulee_spec <-
+  mlp(penalty = tune(), epochs = 200L) %>%
   set_engine('brulee')   %>%
   set_mode('classification')     
           
@@ -517,7 +644,7 @@ dep_models <-
                     svm = svm_rbf_kernlab_spec,
                     pls = pls_mixOmics_spec,
                     discrim = discrim_linear_mda_spec,
-                    brulee = logistic_reg_brulee_spec),
+                    brulee = brulee_spec),
       cross = TRUE
    ) %>% 
   option_add_parameters() |> 
@@ -574,7 +701,7 @@ dep_models <- dep_models |>
     param_info = glm_lagged_params,
     id = "lagged_linear"
   ) |> 
-   workflow_map("tune_grid", resamples = folds, grid = 5, 
+   workflow_map("tune_grid", resamples = folds, grid = 15, 
                 metrics = metric_set(roc_auc), verbose = TRUE)
 
 rank_results(dep_models, rank_metric = "roc_auc", select_best = TRUE)                    
