@@ -38,8 +38,8 @@ if (dir.exists("/kaggle")){
     
 options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
 remotes::install_github("tidymodels/plsmod", quiet = TRUE)    
-remotes::install_github("mayer79/outForest", quiet = TRUE)    
-remotes::install_github("tidyverts/fable.binary")
+#remotes::install_github("mayer79/outForest", quiet = TRUE)    
+#remotes::install_github("tidyverts/fable.binary", quiet = TRUE)
     
 cores <- future::availableCores()
 
@@ -54,12 +54,11 @@ suppressPackageStartupMessages({
 library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
 library(tidymodels) # metapackage see https://www.tidymodels.org/
 
-library(fable)
-library(feasts)
-library(fable.binary)
-    
+   
 library(plsmod)
 library(discrim)
+
+library(DALEXtra) # Tidymodels Explainability         
     
 library(brulee)   # interface to torch
 
@@ -87,18 +86,15 @@ preprocessor <- function(dataframe) {
 dataframe <- dataframe %>%
     janitor::clean_names() |>
 
-
-    group_by(week = id %/% 7) |> 
-    mutate(across(c(where(is.numeric), -day, -id, -winddirection), \(x) mean(x, na.rm = TRUE),  .names = "week_mean_{.col}")) |>
-    ungroup() |>
-  
-    select(-week) |>
-
-    mutate(winddirection = factor(winddirection %/% 10)) |> 
-
     mutate(year = id %/% 365 ,
            day = id - year * 365 ) |> 
-   
+    
+    group_by(day) |> 
+    mutate(across(c(dewpoint, maxtemp, pressure, mintemp, temparature, humidity), \(x) (mean(x, na.rm = TRUE) - x)/sd(x, na.rm = TRUE),  .names = "delta_day_{.col}")) |>
+    ungroup() |>
+    
+    mutate(winddirection = factor(winddirection %/% 20)) |> 
+
     mutate(across(c(where(is.character)), \(x) as.factor(x))) 
 
 return(dataframe)
@@ -159,7 +155,7 @@ competition_df <- all_df %>%
 
 
 features <- train_df %>%
-  select(-id, -rainfall, -day, -year) |> 
+  select(-id, -rainfall, -day, -year, -windspeed) |> 
   names()
 
 train_df <- train_df %>% 
@@ -219,13 +215,16 @@ train_df %>%
     names_to = "metric",
     values_to = "value"
   ) %>%
-  ggplot(aes(value, fill = rainfall)) +
-  geom_histogram(show.legend = FALSE, bins = 200) +
-   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  ggplot(aes(value)) +
+  geom_histogram(aes(fill = rainfall), position = "identity", bins = 30) +
+  geom_freqpoly(aes(linetype = rainfall), bins = 30) +
+  geom_rug(aes(color = rainfall)) +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  guides(color = "none") +
   theme(panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
         plot.title.position = "plot") +
-  labs(color = NULL, fill = "Rainfall",
+  labs(color = NULL, 
        title = "Numeric Feature Univariate Distributions",
        caption = "Data: Kaggle.com | Visual: Jim Gruman")
 
@@ -413,82 +412,7 @@ competition_df %>%
   labs(title = "Pairwise Correlations Competition Set")
 
 ```                    
-
-## Outforest
-
-`outForest` is a multivariate anomaly detection method. Each numeric variable is regressed onto all other variables using a random forest. If the scaled absolute difference between observed value and out-of-bag prediction is larger than a prespecified threshold, then a value is considered an outlier.
-
-A benefit of this technique is noise reduction, at least at the 1 percent most anomylous observations.  A drawback is of applying it at this point to the training data and the cross validation folds is that the CV out of sample estimates of error are smaller than we would see with raw.
-                   
-Computationally, it is faster to run it here. The method relies on the `ranger` package.                 
-
-```{r}
-#| label: outforest anomaly detection and interpolation
-#| fig.width: 12
-#| fig.height: 12    
-
-                   
-outforest_model <- outForest::outForest(
-  data = train_df,
-  formula =  formula(paste0(str_c(features,  collapse = " + "), "~ rainfall")),
-  max_prop_outliers = 0.01,
-  threshold = 3,
-  impute_multivariate_control = list(
-    pmm.k = 3L,
-    num.trees = 250L,
-    maxiter = 3L
-  ),
-  allow_predictions = TRUE
-)
-
-plot(outforest_model)
-
-outforest_preds <- predict(outforest_model, newdata = train_df)
-
-train_df <- outForest::Data(outforest_preds) %>% as_tibble()
-
-```
-
-## Time Series
-                   
-```{r}
-#| label: time series
-#| fig.width: 12
-#| fig.height: 6 
-                   
-rainfall_ts <- train_df |> 
-  mutate(Date = as.Date("2010-01-01") + day + year*365, rainfall = rainfall == 1) |> 
-  select(Date, rainfall, all_of(num_features)) |> 
-  fable.binary::as_tsibble()
-
-rainfall_fit <- rainfall_ts |> 
-  model(
-        nn = BINNET(formula(paste0("rainfall ~ ", 
-               str_c(num_features,  collapse = " + "))))
-  ) 
-
-train_df <- train_df |> 
-  bind_cols(fitted(rainfall_fit) |> select(.fitted)) |> 
-  rename(seasonal_chance = .fitted) |> 
-  select(-Date)
-
-fc <- forecast(rainfall_fit, new_data = competition_df |> 
-                   mutate(Date = as.Date("2010-01-01") + day + year*365) |> 
-                   fable.binary::as_tsibble()
-               )
-
-as_tibble(fc) |>
-    ggplot(aes(x = Date, y = .mean, col = .model)) +
-    geom_line(show.legend = FALSE) +
-    labs(y = "Probability of rain")
-
-competition_df <- competition_df |> 
-  bind_cols(as_tibble(fc) |>  select(.mean)) |> 
-  rename(seasonal_chance = .mean)       
-
-features <- c(features, "seasonal_chance")                              
-```                   
-                   
+               
 
 ## Target
 
@@ -542,37 +466,23 @@ base_rec <- recipe(
   ) %>%     
                    
   step_mutate(cloud_o_sunshine = cloud / (sunshine + 1)) |>   
+  step_mutate(humidity_o_dewpoint = humidity / (dewpoint + 1)) |>   
+
+  step_interact(~ humidity:pressure) |>
+  step_interact(~ humidity:sunshine) |>
+  step_interact(~ cloud:sunshine) |>
+  step_interact(~ temparature:humidity) |>                   
 
   step_impute_mode(all_nominal_predictors()) |>                    
   step_dummy(all_nominal_predictors()) |>     
+
+  step_lag(mintemp, starts_with("delta_day")) |> 
+
+  step_impute_median(all_predictors()) |>                       
                    
   step_zv(all_predictors()) %>%
   step_normalize(all_predictors()) |> 
-  themis::step_upsample(rainfall,over_ratio = 1)
-
-lagged_rec <- recipe(
-    
-    formula(paste0("rainfall ~ ", 
-               str_c(features,  collapse = " + "))),
-    data = train_df
-  ) %>% 
-
-#  step_discretize(winddirection, 
-#                  num_breaks = 6,
-#                  min_unique = 1) |>     
-  step_impute_mode(all_nominal_predictors()) |> 
-  step_dummy(all_nominal_predictors()) |>                    
-
-  step_lag(mintemp) |> 
-  
-  step_impute_median(all_predictors()) |>      
-
-  step_mutate(cloud_o_sunshine = cloud / (sunshine + 1)) |>   
-
-  step_zv(all_predictors()) %>%
-  step_normalize(all_predictors()) |> 
-  themis::step_upsample(rainfall,over_ratio = 1)
-                  
+  themis::step_upsample(rainfall,over_ratio = 1)               
 
 
 folds <- rsample::sliding_period(
@@ -631,15 +541,14 @@ discrim_linear_mda_spec <-
   set_mode('classification')
 
 brulee_spec <-
-  mlp(penalty = tune(), epochs = 200L) %>%
-  set_engine('brulee')   %>%
+  mlp(penalty = tune(), hidden_units = 5L, epochs = 1000L) %>%
+  set_engine('brulee', stop_iter = 100L, rate_schedule = "cyclic")   %>%
   set_mode('classification')     
           
 
 dep_models <- 
    workflow_set(
-      preproc = list(base = base_rec,
-                    lagged = lagged_rec),
+      preproc = list(base = base_rec),
       models = list(linear = logistic_reg_glmnet_spec,
                     svm = svm_rbf_kernlab_spec,
                     pls = pls_mixOmics_spec,
@@ -659,49 +568,49 @@ glm_params <- dep_models |>
   update(
     mixture = mixture(),
     penalty = dials::penalty(range = c(-1,0)))
-
-glm_lagged_params <- dep_models |> 
-    extract_workflow("lagged_linear") |> 
-  parameters() |> 
-  update(
-    mixture = mixture(),
-    penalty = dials::penalty(range = c(-1,0)))
-                   
-                   
+                  
 svm_params <- dep_models |> 
     extract_workflow("base_svm") |> 
   parameters() |> 
   update(
     cost = cost(),
     rbf_sigma = dials::rbf_sigma(range = c(-4,-8)))
-
-svm_lagged_params <- dep_models |> 
-    extract_workflow("lagged_svm") |> 
+       
+pls_params <- dep_models |>
+       extract_workflow("base_pls") |>       
   parameters() |> 
   update(
-    cost = cost(),
-    rbf_sigma = dials::rbf_sigma(range = c(-4,-8)))
+    num_comp = num_comp(range = c(2L,3L)),
+    predictor_prop = predictor_prop(range = c(0,0.25)))
 
+brulee_params <- dep_models |>
+       extract_workflow("base_brulee") |>       
+  parameters() |> 
+  update(
+    penalty = penalty(range = c(-2,0)))       
                    
-
 dep_models <- dep_models |> 
   option_add(
     param_info = svm_params,
     id = "base_svm"
   ) |> 
   option_add(
-    param_info = svm_lagged_params,
-    id = "lagged_svm"
-  ) |> 
-  option_add(
     param_info = glm_params,
     id = "base_linear"
   ) |> 
   option_add(
-    param_info = glm_lagged_params,
-    id = "lagged_linear"
+    param_info = pls_params,
+    id = "base_pls"
   ) |> 
-   workflow_map("tune_grid", resamples = folds, grid = 15, 
+  option_add(
+    param_info = brulee_params,
+    id = "base_brulee"
+  ) |> 
+  option_add(
+    param_info = brulee_params,
+    id = "base_brulee"
+  ) |> 
+   workflow_map("tune_grid", resamples = folds, grid = 25, 
                 metrics = metric_set(roc_auc), verbose = TRUE)
 
 rank_results(dep_models, rank_metric = "roc_auc", select_best = TRUE)                    
@@ -741,29 +650,7 @@ dep_models |>
   finalize_workflow(best_linear_params) |> 
   fit(train_df) |> 
   vip::vip(num_features = 30L)                   
-                   
-  
-dep_models %>%
-  dplyr::filter(grepl("lagged_linear", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
-
-dep_models |> 
-  workflowsets::extract_workflow_set_result("lagged_linear") |> 
-  autoplot() +
-  labs(title = "GLMNET Hyperparameter Search")
-
-best_linear_params <- dep_models |> 
-  workflowsets::extract_workflow_set_result("lagged_linear") |> 
-  select_best(metric = "roc_auc")  
-
-dep_models |> 
-  workflowsets::extract_workflow("lagged_linear") |> 
-  finalize_workflow(best_linear_params) |> 
-  fit(train_df) |> 
-  vip::vip(num_features = 30L)                   
+                                
                    
                    
 ```
@@ -781,13 +668,13 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
 
-dep_models %>%
-  dplyr::filter(grepl("lagged_svm", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
-                   
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_svm") |> 
+  autoplot() +
+  labs(title = "SVM Hyperparameter Search")                   
+
+       
+                    
 
 ```
 
@@ -803,12 +690,11 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
 
-dep_models %>%
-  dplyr::filter(grepl("lagged_pls", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_pls") |> 
+  autoplot() +
+  labs(title = "PLS Hyperparameter Search")                        
+                      
                    
 ```
 
@@ -823,12 +709,10 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
 
-dep_models %>%
-  dplyr::filter(grepl("lagged_discrim", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_discrim") |> 
+  autoplot() +
+  labs(title = "Discrim Hyperparameter Search")   
                    
 ```          
 
@@ -843,12 +727,10 @@ dep_models %>%
   tidyr::unnest(cols = metrics) |> 
   arrange(desc(mean))
 
-dep_models %>%
-  dplyr::filter(grepl("lagged_brulee", wflow_id)) %>%
-  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-  dplyr::select(wflow_id, metrics) %>%
-  tidyr::unnest(cols = metrics) |> 
-  arrange(desc(mean))
+dep_models |> 
+  workflowsets::extract_workflow_set_result("base_brulee") |> 
+  autoplot() +
+  labs(title = "Brulee Hyperparameter Search")   
                    
 ```           
 
@@ -886,6 +768,65 @@ classification_fit <- fit(final_wf, data = train_df)
 ```
 
 # Performance {.tabset .tabset-fade .tabset-pills}
+
+## DALEX
+
+```{r}
+#| label: explainer
+#| warning: false
+#| message: false
+
+explainer <- 
+  explain_tidymodels(
+    classification_fit, 
+    data = train_df %>% dplyr::select(all_of(features)), 
+    y = as.numeric(train_df$rainfall),
+    label = "Ensemble",
+    verbose = FALSE
+  )  %>% 
+  model_parts()
+
+ggplot_imp <- function(...) {
+  obj <- list(...)
+  metric_name <- attr(obj[[1]], "loss_name")
+  metric_lab <- paste(metric_name, 
+                      "after permutations\n(higher indicates more important)")
+  
+  full_vip <- bind_rows(obj) %>%
+    filter(variable != "_baseline_")
+  
+  perm_vals <- full_vip %>% 
+    filter(variable == "_full_model_") %>% 
+    group_by(label) %>% 
+    summarise(dropout_loss = mean(dropout_loss))
+  
+  p <- full_vip %>%
+    filter(variable != "_full_model_") %>% 
+    mutate(variable = fct_reorder(variable, dropout_loss)) %>%
+    ggplot(aes(dropout_loss, variable)) 
+  if(length(obj) > 1) {
+    p <- p + 
+      facet_wrap(vars(label)) +
+      geom_vline(data = perm_vals, aes(xintercept = dropout_loss, color = label),
+                 linewidth = 1.4, lty = 2, alpha = 0.7) +
+      geom_boxplot(aes(color = label, fill = label), alpha = 0.2)
+  } else {
+    p <- p + 
+      geom_vline(data = perm_vals, aes(xintercept = dropout_loss),
+                 linewidth = 1.4, lty = 2, alpha = 0.7) +
+      geom_boxplot(fill = "#91CBD765", alpha = 0.4)
+    
+  }
+  p +
+    theme(legend.position = "none") +
+    labs(x = metric_lab, 
+         y = NULL,  fill = NULL,  color = NULL)
+}
+                   
+ggplot_imp(explainer)     
+                   
+
+```                   
 
 ## Submission
 ```{r }                   
