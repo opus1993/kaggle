@@ -1,1 +1,660 @@
-{"metadata":{"kernelspec":{"display_name":"R","language":"R","name":"ir"},"language_info":{"mimetype":"text/x-r-source","name":"R","pygments_lexer":"r","version":"3.4.2","file_extension":".r","codemirror_mode":"r"},"kaggle":{"accelerator":"none","dataSources":[{"sourceId":91716,"databundleVersionId":11893428,"sourceType":"competition"}],"isInternetEnabled":true,"language":"rmarkdown","sourceType":"script","isGpuEnabled":false}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"---\ntitle: \"Calorie Expenditure\"\ndate: '`r Sys.Date()`'\noutput:\n  html_document:\n    number_sections: true\n    fig_caption: true\n    toc: true\n    fig_width: 7\n    fig_height: 4.5\n    theme: cosmo\n    highlight: tango\n    code_folding: hide\n---\n  \n# Introduction  {.tabset .tabset-fade .tabset-pills}\n\nThe goal of this competition is to predict the calorie expenditure from a synthetic datset.\n\nMy notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.\n\nLets dive right in.\n\nThe Kaggle kernels have many of the common r packages built in.  \n\n## Load libraries\n\n```{r }\n#| label: setup\n#| warning: false\n#| message: false\n\nif (dir.exists(\"/kaggle\")){\n  path <- \"/kaggle/input/playground-series-s5e5/\"\n\noptions(repos = c(CRAN = \"https://packagemanager.posit.co/cran/2021-03-22\"))\n\ncores <- future::availableCores()\n\n} else {\n  path <- stringr::str_c(here::here(\"data\"),\"/\")\n  orig_path <- stringr::str_c(here::here(\"data\"),\"/\")\n\n  cores <- future::availableCores(omit = 2)\n}\n \nsuppressPackageStartupMessages({\nlibrary(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages\nlibrary(tidymodels) # metapackage see https://www.tidymodels.org/\n\nlibrary(DALEXtra) # Tidymodels Explainability         \n    \nlibrary(bonsai)   # interface to torch\nlibrary(stacks)   # model ensembling\n\n})\n\ntidymodels_prefer()\nconflicted::conflicts_prefer(brulee::coef)\n\noptions(tidymodels.dark = TRUE)\n\ntheme_set(ggdark::dark_theme_minimal())\n\n```\n\n![](https://www.forksoverknives.com/wp-content/uploads/FOK_CalorieDensity_Final.jpg)\n\n\n## Load Data\n\n```{r }\n#| label: load data\n#| warning: false\n#| message: false\n\npreprocessor <- function(dataframe) {\n\ndataframe <- dataframe %>%\n    janitor::clean_names() %>%\n  \n    mutate(across(c(where(is.character)), ~ as.factor(.x))) \n\nreturn(dataframe)\n}\n\nraw_df <- read_csv(str_c(path, \"train.csv\"),\n                   show_col_types = FALSE) |> \n          preprocessor() \n\ntst_df <- read_csv(str_c(path, \"test.csv\"),\n                   show_col_types = FALSE)  |>  \n  preprocessor() \n\n\n# because we already know the test set, let's remove the train set factor levels that do not correspond with anything on the test set\nfor (col in names(raw_df)) {\n    if (is.factor(raw_df[[col]]) & col != \"rainfall\") {\n      # Get levels in train and test dataframes\n      raw_levels <- levels(raw_df[[col]])\n      tst_levels <- levels(tst_df[[col]])\n      \n      # Identify levels in train not in test\n      new_levels <- setdiff(raw_levels, tst_levels)\n      \n      # Set these levels to NA in train dataframe\n      raw_df[[col]] <- factor(raw_df[[col]], levels = c(tst_levels, new_levels))\n      raw_df[[col]][raw_df[[col]] %in% new_levels] <- NA_character_\n    }\n  }\n\n# the synthetic playground competitions seem to perform better when numerics are also included as factors\nall_df <-\n    bind_rows(raw_df %>% mutate(source = \"train\"),\n              tst_df %>% mutate(source = \"test\")) \n\n\ntrain_df <- all_df %>% \n  filter(source == \"train\") %>% \n  select(-source) \n\ncompetition_df <- all_df %>% \n  filter(source == \"test\") %>% \n  select(-source, -calories)\n\n\n```\n# EDA {.tabset .tabset-fade .tabset-pills}\n\n## Features\n\nWe will de-duplicate the training set and calculate a mean calories figure.\n\n```{r}\n#| label: Features\n#| warning: false\n#| message: false\n#| fig.width: 6\n\nconflicted::conflict_prefer(\"select\", \"dplyr\")\nconflicted::conflict_prefer(\"where\", \"dplyr\")\n\nfeatures <- train_df %>%\n  dplyr::select(-id, -calories) |> \n  names()\n\ntrain_df <- train_df %>% \n  dplyr::group_by_at(all_of(features)) |> \n  dplyr::summarise(id = min(id),\n            calories = mean(calories),\n            .groups = \"drop\")\n\nnom_features <- train_df |> \n  dplyr::select(dplyr::all_of(features)) |> \n  dplyr::select(dplyr::where(is.factor)) |> \n  names() \n\nlogical_features <- train_df |> \n  dplyr::select(dplyr::all_of(features)) |> \n  dplyr::select(dplyr::where(is.logical)) |> \n  names() \n\nnum_features <- train_df |> \n  dplyr::select(dplyr::all_of(features)) |> \n  dplyr::select(dplyr::where(is.numeric)) |> \n  names()\n```\n\nNominal features:\n\n`r nom_features`\n\nNumeric features: \n\n`r num_features`\n\nLogical features: \n\n`r logical_features`\n\n\nSize of the combined train and competition datasets:\n\n`r nrow(all_df)`\n\nSize of training set after de-duplication\n\n`r nrow(train_df)`\n\n\n## Numeric features\n\n\n\n```{r}\n#| label: numeric\n#| warning: false\n#| message: false\n#| fig.height: 6\n#| fig.width: 12\n\ntrain_df %>% \n  select(all_of(num_features), calories ) %>% \n  pivot_longer(-calories,\n    names_to = \"metric\",\n    values_to = \"value\"\n  ) %>%\n  ggplot(aes(value, fill = ggplot2::cut_number(calories, 5))) +\n  geom_histogram(bins = 200) +\n  facet_wrap(vars(metric), scales = \"free\", ncol = 2) +\n  theme(panel.grid.major = element_blank(),\n        panel.grid.minor = element_blank(),\n        legend.position = \"top\") +\n  labs(color = NULL, fill = \"Calories\",\n       title = \"Numeric Feature Univariate Distributions\",\n       caption = \"Data: Kaggle | Visual: Jim Gruman\")\n\ntrain_df %>% \n  select(all_of(num_features), calories ) %>% \n  pivot_longer(-calories,\n    names_to = \"metric\",\n    values_to = \"value\"\n  ) %>%\n  ggplot(aes(value, calories)) +\n  geom_point(shape = 20, alpha = 0.01) +\n   facet_wrap(vars(metric), scales = \"free\", ncol = 2) +\n  theme(panel.grid.major = element_blank(),\n        panel.grid.minor = element_blank(),\n        legend.position = \"top\") +\n  labs(color = NULL, fill = \"Calories\",\n       title = \"Numeric Features and Calories\",\n       caption = \"Data: Kaggle | Visual: Jim Gruman\")\n\n```\n\n\n## Nominal features\n\nExplore the distribution of outcome class by factor level.\n\n\n```{r}\n#| label: nominal\n#| warning: false\n#| message: false\n#| fig.height: 6\n#| fig.width: 6\n\n\nif(length(nom_features) >0){\n\ntrain_df %>% \n  select(all_of(nom_features), calories) %>% \n  mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%\n  pivot_longer(-calories,\n    names_to = \"metric\",\n    values_to = \"value\"\n  ) %>%\n    \n  filter(!is.na(calories)) %>% \n    \n  summarise(n = n(),\n            .by = c(calories, metric, value)) %>%\n      \n  mutate(value = tidytext::reorder_within(value, n, metric)) %>%\n    \n  ggplot(aes(x = n, y = value, fill = ggplot2::cut_number(calories, 5))) +\n  geom_col() +\n  tidytext::scale_y_reordered() +\n  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +\n  facet_wrap(vars(metric), scales = \"free\", ncol = 2) +\n  theme(panel.grid.major = element_blank(),\n        panel.grid.minor = element_blank(),\n       legend.position = \"bottom\") +\n  labs(title = \"Nominal Feature Counts\",\n       fill = NULL,\n       caption = \"Data: Kaggle | Visual: Jim Gruman\")\n\n}\n\n```\n\n\n## Counts of Missingness\n\n                  \n```{r}\n#| label: counts of missingness\n\ntrain_df %>% \n  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% \n  pivot_longer(everything(),\n              names_to = \"feature\",\n              values_to = \"Count of Missing\") %>% \n                   knitr::kable()\n\ncompetition_df %>% \n  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% \n  pivot_longer(everything(),\n              names_to = \"feature\",\n              values_to = \"Count of Missing\") %>% \n                   knitr::kable()\n\n```\n\n## Counts of Distinct\n                   \n               \n```{r}\n#| label: counts of distinct\n               \ntrain_df %>%\n  summarize(across(all_of(features), n_distinct)) %>%\n  pivot_longer(everything(), names_to = \"feature\", values_to = \"Count of distinct train\") |>\n  left_join(\n    competition_df %>%\n      summarize(across(all_of(features), n_distinct)) %>%\n      pivot_longer(everything(), names_to = \"feature\", values_to = \"Count of distinct test\"),\n    by = join_by(feature)\n  ) %>% \n                   knitr::kable()\n               \n```\n\n## Duplicated\n\nIs this competition transaction already in the training data with a correct label?\n\nIt looks as though the answer may be yes\n\n```{r}\n#| label: duplicates\n#| warning: false\n#| message: false\n\nbind_rows(train_df %>% mutate(source = \"train\"),\n              competition_df %>% mutate(source = \"test\")) |> \n    group_by_at(features) %>%\n    mutate(num_dups = n(),\n           dup_id = row_number()) %>% \n    ungroup() %>% \n    group_by(source) %>%\n    mutate(is_duplicated = dup_id > 1) %>% \n    count(is_duplicated) %>% \n                   knitr::kable()\n\n\nbind_rows(train_df %>% mutate(source = \"train\"),\n              competition_df %>% mutate(source = \"test\")) |> \n    group_by_at(features) %>%\n    mutate(num_dups = n(),\n           dup_id = row_number()) %>% \n    filter(num_dups > 1 ) |> \n    arrange(age, height, weight, duration) |> \n    slice_head(n = 15)\n               \n\n```\n\n\n## Pairwise Correlations\n                   \n`ggcorrplot` provides a quick look at numeric features where the correlation may be significant. \n\n```{r}\n#| label: pairwise correlations\n#| fig.width: 12\n#| fig.height: 12                   \n                   \ntrain_df %>% \n  select(all_of(num_features)) %>% \n  ggcorrplot::cor_pmat() %>% \n  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,\n    type = \"lower\", insig = \"blank\") +\n  labs(title = \"Pairwise Correlations Training Set\")\n                   \ncompetition_df %>% \n  select(all_of(num_features)) %>% \n  ggcorrplot::cor_pmat() %>% \n  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,\n    type = \"lower\", insig = \"blank\") +\n  labs(title = \"Pairwise Correlations Competition Set\")\n\n```                    \n               \n## Correlation Funnel\n\n```{r}\n\nlibrary(correlationfunnel)\n\ncalories_df <- as_tibble(train_df$calories)\n\ntrain_df %>% \n  select(all_of(features)) %>% \n    binarize(one_hot = TRUE) %>%\n    bind_cols(calories_df) |> \n    mutate(value = as.numeric(value) -1) |> \n    rename(calories = value) |> \n    correlate(target = calories ) %>% \n    plot_correlation_funnel()\n\n```\n\n                   \n## Target\n\nThe outcome variable distribution is skewed with values between 1 and 314.\n\n```{r}\n#| label: outcome \n#| warning: false\n#| message: false\n#| fig.width: 6\n\ntrain_df |> count(calories) |> arrange(desc(calories))    \n\ntrain_df |> count(calories) |> arrange(calories)    \n\ntrain_df %>% \n  ggplot(aes(calories)) +\n  geom_histogram(bins = 100) +\n  scale_x_continuous(labels = scales::comma) +\n  labs(title = \"Calories\",\n       caption = \"Data: Kaggle.com | Visual: Jim Gruman\")\n\n\n\n```\n \n           \n                \n# Regression Machine Learning {.tabset .tabset-fade .tabset-pills}\n\n## Root Mean Squared Log Error\n\n\n```{r}\n#| label: custom RMSLE metric\n\nrmsle_impl <- function(truth, estimate, case_weights = NULL) {\n\n      sqrt( mean(  ((log1p(truth) - log1p(estimate))^2 )))\n    \n}\n\n\nrmsle_vec <- function(truth, estimate, na_rm = TRUE, case_weights = NULL, ...) {\n  check_numeric_metric(truth, estimate, case_weights)\n\n  if (na_rm) {\n    result <- yardstick_remove_missing(truth, estimate, case_weights)\n\n    truth <- result$truth\n    estimate <- result$estimate\n    case_weights <- result$case_weights\n  } else if (yardstick_any_missing(truth, estimate, case_weights)) {\n    return(NA_real_)\n  }\n\n  rmsle_impl(truth, estimate, case_weights = case_weights)\n}\n\nrmsle <- function(data, ...) {\n  UseMethod(\"rmsle\")\n}\n\nrmsle <- new_numeric_metric(rmsle, direction = \"minimize\")\n\nrmsle.data.frame <- function(data, truth, estimate, na_rm = TRUE, case_weights = NULL, ...) {\n\n  numeric_metric_summarizer(\n    name = \"rmsle\",\n    fn = rmsle_vec,\n    data = data,\n    truth = !!enquo(truth),\n    estimate = !!enquo(estimate),\n    na_rm = na_rm,\n    case_weights = !!enquo(case_weights)\n  )\n}\n\nmetrics <- metric_set(rmsle)\n\n```\n\n## Recipe\n\n```{r}\n#| label: recipe\n#| warning: false\n#| message: false\n#| fig.width: 6\n                   \nlgbm_rec <- recipe(formula(paste0(\"calories ~ \", str_c(features, collapse = \" + \"))), data = train_df) \n\nxgb_rec <- lgbm_rec |> \n           step_dummy(all_nominal_predictors(), one_hot = TRUE) \n\n\nfolds <- vfold_cv(train_df,\n                  v = 5,\n                  repeats = 1,\n                  strata = calories)\n\n                   \n```\n\n\n\n## Workflowsets\n\n```{r}\n#| label: workflowsets\n#| warning: false\n#| message: false\n\nboost_tree_lgbm_spec <- \n  boost_tree(\n    trees = 200L,\n   tree_depth = tune(),\n   learn_rate =  tune(),\n   min_n = tune(),\n   loss_reduction = tune()\n  ) %>% \n  set_engine(engine = \"lightgbm\",\n             is_unbalance = TRUE,\n             num_leaves = tune(),\n             num_threads = cores\n             ) %>%\n  set_mode(mode = \"regression\") \n\n\nboost_tree_xgb_spec <- \n  boost_tree(\n    trees = 200L,\n    min_n = tune(),\n    learn_rate = tune()\n  ) %>% \n  set_engine(engine = \"xgboost\", nthread = cores) %>%\n  set_mode(mode = \"regression\")                    \n\ndep_models <- \n   workflow_set(\n      preproc = list(imputed = xgb_rec,\n                     base = lgbm_rec),\n      models = list(xgb = boost_tree_xgb_spec,\n                    lgbm = boost_tree_lgbm_spec),\n      cross = FALSE\n   ) %>% \n  option_add_parameters() |> \n  option_add(\n    control = finetune::control_sim_anneal( save_pred = TRUE, save_workflow = TRUE, verbose = TRUE),\n    metrics = metrics\n  )\n\nxgb_params <- dep_models |>\n  extract_workflow(\"imputed_xgb\") |>\n  parameters() |>\n  update(\n    learn_rate = learn_rate(range = c(-2.8,-1.0)),\n    min_n = min_n(range = c(10,35))\n    )\n\nlgbm_params <- dep_models |> \n  extract_workflow(\"base_lgbm\") |> \n  parameters() |> \n  update(\n      min_n = min_n(range = c(10,70)),\n      loss_reduction = loss_reduction(range = c(-1,0)),\n      tree_depth = tree_depth(range = c(20,100)),\n      learn_rate = learn_rate(range = c(-1.9,-1.0)),\n      num_leaves = num_leaves(range = c(100,400))       \n         )\n\ndep_models <- dep_models |> \n  option_add(\n    param_info = lgbm_params,\n    id = \"base_lgbm\"\n  ) |> \n  option_add(\n    param_info = xgb_params,\n    id = \"imputed_xgb\"\n  ) |>\n   workflow_map(\"tune_sim_anneal\", resamples = folds, iter = 6, \n                metrics = metrics, verbose = TRUE)\n                   \n\nautoplot(dep_models) +\n  geom_text(aes(y = mean -0.01, label = wflow_id), angle = 90, hjust = 1)+\n  scale_y_continuous(limits = c(0,NA)) |>\n  theme(legend.position = \"none\")\n\nrank_results(dep_models, rank_metric = \"rmsle\", select_best = TRUE) %>% \n   select(rank, mean, model, wflow_id, .config)\n\ndep_models %>%\n  dplyr::filter(grepl(\"xgb\", wflow_id)) %>%\n  mutate(metrics = map(result, collect_metrics)) %>%\n  dplyr::select(wflow_id, metrics) %>%\n  tidyr::unnest(cols = metrics) |> \n  arrange(mean)\n\ndep_models %>%\n  dplyr::filter(grepl(\"lgbm\", wflow_id)) %>%\n  mutate(metrics = map(result, collect_metrics)) %>%\n  dplyr::select(wflow_id, metrics) %>%\n  tidyr::unnest(cols = metrics) |> \n  arrange(mean)\n\n\ndep_stack <- stacks() %>%\n  add_candidates(dep_models) %>%\n  blend_predictions(  metric = metrics,\n      penalty = c(10^seq(-1.7, -0.3, 0.1)),\n      non_negative = TRUE,\n      control = tune::control_grid(allow_par = TRUE))\n\nautoplot(dep_stack)\n\nautoplot(dep_stack, type = \"members\")        \n                   \nautoplot(dep_stack, \"weights\")\n                   \nregression_fit <- dep_stack %>% \n    fit_members()\n\n\n```\n                   \n# Submission\n                   \n\n```{r}\n#| label: submission\n#| warning: false\n#| message: false\n#| fig.height: 6\n#| fig.width: 6                    \n                   \naugment(regression_fit, train_df) %>% \n  ggplot(aes(.pred, calories)) +\n  geom_point(alpha = 0.1, shape = 20) +\n  geom_abline(color = \"green\") \n\nsubmit_df <-  augment(\n  regression_fit,\n  competition_df %>%\n    left_join(train_df %>% select(-id), by = all_of(features)) %>%\n    rename(train_calories = calories)\n) %>%\n  transmute(id, calories = if_else(is.na(train_calories), .pred, train_calories)) \n\n\nhead(submit_df)  %>% \n     knitr::kable()      \n\nsubmit_df  %>% \n  write_csv(\"submission.csv\")\n```    ","metadata":{"_uuid":"ae34471e-b19c-4e71-a0a1-1a048612bddf","_cell_guid":"5ac8c7dd-cd90-470a-8715-a9850e03c0d9","trusted":true,"collapsed":false,"jupyter":{"outputs_hidden":false}},"outputs":[],"execution_count":null}]}
+---
+title: "Calorie Expenditure"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+  
+# Introduction  {.tabset .tabset-fade .tabset-pills}
+
+The goal of this competition is to predict the calorie expenditure from a synthetic datset.
+
+My notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+The Kaggle kernels have many of the common r packages built in.  
+
+## Load libraries
+
+```{r }
+#| label: setup
+#| warning: false
+#| message: false
+
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s5e5/"
+
+options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
+
+cores <- future::availableCores()
+
+} else {
+  path <- stringr::str_c(here::here("data"),"/")
+  orig_path <- stringr::str_c(here::here("data"),"/")
+
+  cores <- future::availableCores(omit = 2)
+}
+ 
+suppressPackageStartupMessages({
+library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
+library(tidymodels) # metapackage see https://www.tidymodels.org/
+
+library(DALEXtra) # Tidymodels Explainability         
+    
+library(bonsai)   # interface to torch
+library(stacks)   # model ensembling
+
+})
+
+tidymodels_prefer()
+conflicted::conflicts_prefer(brulee::coef)
+
+options(tidymodels.dark = TRUE)
+
+theme_set(ggdark::dark_theme_minimal())
+
+```
+
+![](https://www.forksoverknives.com/wp-content/uploads/FOK_CalorieDensity_Final.jpg)
+
+
+## Load Data
+
+```{r }
+#| label: load data
+#| warning: false
+#| message: false
+
+preprocessor <- function(dataframe) {
+
+dataframe <- dataframe %>%
+    janitor::clean_names() %>%
+  
+    mutate(across(c(where(is.character)), ~ as.factor(.x))) 
+
+return(dataframe)
+}
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) |> 
+          preprocessor() 
+
+tst_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE)  |>  
+  preprocessor() 
+
+
+# because we already know the test set, let's remove the train set factor levels that do not correspond with anything on the test set
+for (col in names(raw_df)) {
+    if (is.factor(raw_df[[col]]) & col != "rainfall") {
+      # Get levels in train and test dataframes
+      raw_levels <- levels(raw_df[[col]])
+      tst_levels <- levels(tst_df[[col]])
+      
+      # Identify levels in train not in test
+      new_levels <- setdiff(raw_levels, tst_levels)
+      
+      # Set these levels to NA in train dataframe
+      raw_df[[col]] <- factor(raw_df[[col]], levels = c(tst_levels, new_levels))
+      raw_df[[col]][raw_df[[col]] %in% new_levels] <- NA_character_
+    }
+  }
+
+# the synthetic playground competitions seem to perform better when numerics are also included as factors
+all_df <-
+    bind_rows(raw_df %>% mutate(source = "train"),
+              tst_df %>% mutate(source = "test")) 
+
+
+train_df <- all_df %>% 
+  filter(source == "train") %>% 
+  select(-source) 
+
+competition_df <- all_df %>% 
+  filter(source == "test") %>% 
+  select(-source, -calories)
+
+
+```
+# EDA {.tabset .tabset-fade .tabset-pills}
+
+## Features
+
+We will de-duplicate the training set and calculate a mean calories figure.
+
+```{r}
+#| label: Features
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("where", "dplyr")
+
+features <- train_df %>%
+  dplyr::select(-id, -calories) |> 
+  names()
+
+train_df <- train_df %>% 
+  dplyr::group_by_at(all_of(features)) |> 
+  dplyr::summarise(id = min(id),
+            calories = mean(calories),
+            .groups = "drop")
+
+nom_features <- train_df |> 
+  dplyr::select(dplyr::all_of(features)) |> 
+  dplyr::select(dplyr::where(is.factor)) |> 
+  names() 
+
+logical_features <- train_df |> 
+  dplyr::select(dplyr::all_of(features)) |> 
+  dplyr::select(dplyr::where(is.logical)) |> 
+  names() 
+
+num_features <- train_df |> 
+  dplyr::select(dplyr::all_of(features)) |> 
+  dplyr::select(dplyr::where(is.numeric)) |> 
+  names()
+```
+
+Nominal features:
+
+`r nom_features`
+
+Numeric features: 
+
+`r num_features`
+
+Logical features: 
+
+`r logical_features`
+
+
+Size of the combined train and competition datasets:
+
+`r nrow(all_df)`
+
+Size of training set after de-duplication
+
+`r nrow(train_df)`
+
+
+## Numeric features
+
+
+
+```{r}
+#| label: numeric
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 12
+
+train_df %>% 
+  select(all_of(num_features), calories ) %>% 
+  pivot_longer(-calories,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, fill = ggplot2::cut_number(calories, 5))) +
+  geom_histogram(bins = 200) +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "top") +
+  labs(color = NULL, fill = "Calories",
+       title = "Numeric Feature Univariate Distributions",
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+train_df %>% 
+  select(all_of(num_features), calories ) %>% 
+  pivot_longer(-calories,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, calories)) +
+  geom_point(shape = 20, alpha = 0.01) +
+   facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "top") +
+  labs(color = NULL, fill = "Calories",
+       title = "Numeric Features and Calories",
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+```
+
+
+## Nominal features
+
+Explore the distribution of outcome class by factor level.
+
+
+```{r}
+#| label: nominal
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 6
+
+
+if(length(nom_features) >0){
+
+train_df %>% 
+  select(all_of(nom_features), calories) %>% 
+  mutate(across(nom_features, fct_lump_n,n = 10, other_level = 'other')) %>%
+  pivot_longer(-calories,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+    
+  filter(!is.na(calories)) %>% 
+    
+  summarise(n = n(),
+            .by = c(calories, metric, value)) %>%
+      
+  mutate(value = tidytext::reorder_within(value, n, metric)) %>%
+    
+  ggplot(aes(x = n, y = value, fill = ggplot2::cut_number(calories, 5))) +
+  geom_col() +
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+       legend.position = "bottom") +
+  labs(title = "Nominal Feature Counts",
+       fill = NULL,
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+}
+
+```
+
+
+## Counts of Missingness
+
+                  
+```{r}
+#| label: counts of missingness
+
+train_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+
+competition_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+
+```
+
+## Counts of Distinct
+                   
+               
+```{r}
+#| label: counts of distinct
+               
+train_df %>%
+  summarize(across(all_of(features), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct train") |>
+  left_join(
+    competition_df %>%
+      summarize(across(all_of(features), n_distinct)) %>%
+      pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct test"),
+    by = join_by(feature)
+  ) %>% 
+                   knitr::kable()
+               
+```
+
+## Duplicated
+
+Is this competition transaction already in the training data with a correct label?
+
+It looks as though the answer may be yes
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+
+bind_rows(train_df %>% mutate(source = "train"),
+              competition_df %>% mutate(source = "test")) |> 
+    group_by_at(features) %>%
+    mutate(num_dups = n(),
+           dup_id = row_number()) %>% 
+    ungroup() %>% 
+    group_by(source) %>%
+    mutate(is_duplicated = dup_id > 1) %>% 
+    count(is_duplicated) %>% 
+                   knitr::kable()
+
+
+bind_rows(train_df %>% mutate(source = "train"),
+              competition_df %>% mutate(source = "test")) |> 
+    group_by_at(features) %>%
+    mutate(num_dups = n(),
+           dup_id = row_number()) %>% 
+    filter(num_dups > 1 ) |> 
+    arrange(age, height, weight, duration) |> 
+    slice_head(n = 15)
+               
+
+```
+
+
+## Pairwise Correlations
+                   
+`ggcorrplot` provides a quick look at numeric features where the correlation may be significant. 
+
+```{r}
+#| label: pairwise correlations
+#| fig.width: 12
+#| fig.height: 12                   
+                   
+train_df %>% 
+  select(all_of(num_features)) %>% 
+  ggcorrplot::cor_pmat() %>% 
+  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,
+    type = "lower", insig = "blank") +
+  labs(title = "Pairwise Correlations Training Set")
+                   
+competition_df %>% 
+  select(all_of(num_features)) %>% 
+  ggcorrplot::cor_pmat() %>% 
+  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,
+    type = "lower", insig = "blank") +
+  labs(title = "Pairwise Correlations Competition Set")
+
+```                    
+               
+## Correlation Funnel
+
+```{r}
+
+library(correlationfunnel)
+
+calories_df <- as_tibble(train_df$calories)
+
+train_df %>% 
+  select(all_of(features)) %>% 
+    binarize(one_hot = TRUE) %>%
+    bind_cols(calories_df) |> 
+    mutate(value = as.numeric(value) -1) |> 
+    rename(calories = value) |> 
+    correlate(target = calories ) %>% 
+    plot_correlation_funnel()
+
+```
+
+                   
+## Target
+
+The outcome variable distribution is skewed with values between 1 and 314.
+
+```{r}
+#| label: outcome 
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+train_df |> count(calories) |> arrange(desc(calories))    
+
+train_df |> count(calories) |> arrange(calories)    
+
+train_df %>% 
+  ggplot(aes(calories)) +
+  geom_histogram(bins = 100) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(title = "Calories",
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+
+
+```
+ 
+           
+                
+# Regression Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+## Root Mean Squared Log Error
+
+
+```{r}
+#| label: custom RMSLE metric
+
+rmsle_impl <- function(truth, estimate, case_weights = NULL) {
+
+      sqrt( mean(  ((log1p(truth) - log1p(estimate))^2 )))
+    
+}
+
+
+rmsle_vec <- function(truth, estimate, na_rm = TRUE, case_weights = NULL, ...) {
+  check_numeric_metric(truth, estimate, case_weights)
+
+  if (na_rm) {
+    result <- yardstick_remove_missing(truth, estimate, case_weights)
+
+    truth <- result$truth
+    estimate <- result$estimate
+    case_weights <- result$case_weights
+  } else if (yardstick_any_missing(truth, estimate, case_weights)) {
+    return(NA_real_)
+  }
+
+  rmsle_impl(truth, estimate, case_weights = case_weights)
+}
+
+rmsle <- function(data, ...) {
+  UseMethod("rmsle")
+}
+
+rmsle <- new_numeric_metric(rmsle, direction = "minimize")
+
+rmsle.data.frame <- function(data, truth, estimate, na_rm = TRUE, case_weights = NULL, ...) {
+
+  numeric_metric_summarizer(
+    name = "rmsle",
+    fn = rmsle_vec,
+    data = data,
+    truth = !!enquo(truth),
+    estimate = !!enquo(estimate),
+    na_rm = na_rm,
+    case_weights = !!enquo(case_weights)
+  )
+}
+
+metrics <- metric_set(rmsle)
+
+```
+
+## Recipe
+
+```{r}
+#| label: recipe
+#| warning: false
+#| message: false
+#| fig.width: 6
+                   
+lgbm_rec <- recipe(formula(paste0("calories ~ ", str_c(features, collapse = " + "))), data = train_df) 
+
+xgb_rec <- lgbm_rec |> 
+           step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+
+folds <- vfold_cv(train_df,
+                  v = 5,
+                  repeats = 1,
+                  strata = calories)
+
+                   
+```
+
+
+
+## Workflowsets
+
+```{r}
+#| label: workflowsets
+#| warning: false
+#| message: false
+
+boost_tree_lgbm_spec <- 
+  boost_tree(
+    trees = 200L,
+   tree_depth = tune(),
+   learn_rate =  tune(),
+   min_n = tune(),
+   loss_reduction = tune()
+  ) %>% 
+  set_engine(engine = "lightgbm",
+             is_unbalance = TRUE,
+             num_leaves = tune(),
+             num_threads = cores
+             ) %>%
+  set_mode(mode = "regression") 
+
+
+boost_tree_xgb_spec <- 
+  boost_tree(
+    trees = 200L,
+    min_n = tune(),
+    learn_rate = tune()
+  ) %>% 
+  set_engine(engine = "xgboost", nthread = cores) %>%
+  set_mode(mode = "regression")                    
+
+dep_models <- 
+   workflow_set(
+      preproc = list(imputed = xgb_rec,
+                     base = lgbm_rec),
+      models = list(xgb = boost_tree_xgb_spec,
+                    lgbm = boost_tree_lgbm_spec),
+      cross = FALSE
+   ) %>% 
+  option_add_parameters() |> 
+  option_add(
+    control = finetune::control_sim_anneal( save_pred = TRUE, save_workflow = TRUE, verbose = TRUE),
+    metrics = metrics
+  )
+
+xgb_params <- dep_models |>
+  extract_workflow("imputed_xgb") |>
+  parameters() |>
+  update(
+    learn_rate = learn_rate(range = c(-2.8,-1.0)),
+    min_n = min_n(range = c(10,35))
+    )
+
+lgbm_params <- dep_models |> 
+  extract_workflow("base_lgbm") |> 
+  parameters() |> 
+  update(
+      min_n = min_n(range = c(10,70)),
+      loss_reduction = loss_reduction(range = c(-1,0)),
+      tree_depth = tree_depth(range = c(20,100)),
+      learn_rate = learn_rate(range = c(-1.9,-1.0)),
+      num_leaves = num_leaves(range = c(100,400))       
+         )
+
+dep_models <- dep_models |> 
+  option_add(
+    param_info = lgbm_params,
+    id = "base_lgbm"
+  ) |> 
+  option_add(
+    param_info = xgb_params,
+    id = "imputed_xgb"
+  ) |>
+   workflow_map("tune_sim_anneal", resamples = folds, iter = 6, 
+                metrics = metrics, verbose = TRUE)
+                   
+
+autoplot(dep_models) +
+  geom_text(aes(y = mean -0.01, label = wflow_id), angle = 90, hjust = 1)+
+  scale_y_continuous(limits = c(0,NA)) |>
+  theme(legend.position = "none")
+
+rank_results(dep_models, rank_metric = "rmsle", select_best = TRUE) %>% 
+   select(rank, mean, model, wflow_id, .config)
+
+dep_models %>%
+  dplyr::filter(grepl("xgb", wflow_id)) %>%
+  mutate(metrics = map(result, collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(mean)
+
+dep_models %>%
+  dplyr::filter(grepl("lgbm", wflow_id)) %>%
+  mutate(metrics = map(result, collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(mean)
+
+
+dep_stack <- stacks() %>%
+  add_candidates(dep_models) %>%
+  blend_predictions(  metric = metrics,
+      penalty = c(10^seq(-1.7, -0.3, 0.1)),
+      non_negative = TRUE,
+      control = tune::control_grid(allow_par = TRUE))
+
+autoplot(dep_stack)
+
+autoplot(dep_stack, type = "members")        
+                   
+autoplot(dep_stack, "weights")
+                   
+regression_fit <- dep_stack %>% 
+    fit_members()
+
+
+```
+                   
+# Submission
+                   
+
+```{r}
+#| label: submission
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 6                    
+                   
+augment(regression_fit, train_df) %>% 
+  ggplot(aes(.pred, calories)) +
+  geom_point(alpha = 0.1, shape = 20) +
+  geom_abline(color = "green") 
+
+submit_df <-  augment(
+  regression_fit,
+  competition_df %>%
+    left_join(train_df %>% select(-id), by = all_of(features)) %>%
+    rename(train_calories = calories)
+) %>%
+  transmute(id, calories = if_else(is.na(train_calories), .pred, train_calories)) 
+
+
+head(submit_df)  %>% 
+     knitr::kable()      
+
+submit_df  %>% 
+  write_csv("submission.csv")
+```    
