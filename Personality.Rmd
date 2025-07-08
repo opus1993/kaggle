@@ -66,7 +66,8 @@ library(catboost)
 library(stacks)  # ensembling
     
 library(DALEXtra) # Tidymodels Explainability     
-
+    
+library(probably) # model calibration
 })
 
 tidymodels_prefer()
@@ -112,9 +113,10 @@ return(dataframe)
 raw_df <- read_csv(str_c(path, "train.csv"),
                    show_col_types = FALSE) |> 
 
-          bind_rows(
-                     read_csv(str_c(orig_path,"personality_dataset.csv")) 
-          ) |>
+#          bind_rows(
+#                     read_csv(str_c(orig_path,"personality_dataset.csv")) |>
+#                          mutate(Personality = if_else(Personality == "Extrovert", "Introvert", "Extrovert"))  # flip per @paddykb
+#          ) |>
 
           preprocessor() 
 
@@ -143,14 +145,14 @@ all_df <-
     bind_rows(raw_df %>% mutate(source = "train"),
               tst_df %>% mutate(source = "test")) 
 
-cluster_fit <- all_df |> 
-  select(where(is.numeric), -id) |> 
-  mutate(across(everything(), \(x) replace_na(x, -1))) |> 
-  mutate(across(where(is.numeric), scale)) |> 
-  kmeans(centers = 25)
+#cluster_fit <- all_df |> 
+#  select(where(is.numeric), -id) |> 
+#  mutate(across(everything(), \(x) replace_na(x, -1))) |> 
+#  mutate(across(where(is.numeric), scale)) |> 
+#  kmeans(centers = 25)
 
-all_df <- all_df |> 
-  bind_cols(tibble(cluster = factor(fitted(cluster_fit, method = "classes"))))
+#all_df <- all_df |> 
+#  bind_cols(tibble(cluster = factor(fitted(cluster_fit, method = "classes"))))
 
 train_df <- all_df %>% 
   filter(source == "train") %>% 
@@ -468,6 +470,7 @@ impute_rec <- base_rec |>
   step_impute_median(all_numeric_predictors())
 
 dummy_rec <- impute_rec|> 
+  step_interact(~ all_numeric_predictors():all_numeric_predictors()) |>
   step_dummy(all_nominal_predictors()) |> 
   step_normalize(all_predictors())                         
                  
@@ -489,20 +492,21 @@ folds <- vfold_cv(train_df, v = 10, strata = personality)
 
 boost_tree_lgbm_spec <- 
   boost_tree(
-    trees = 50L,
+    trees = 3000L,
    tree_depth = tune(),
    learn_rate =  tune(),
    min_n = tune()
   ) %>% 
   set_engine(engine = "lightgbm",
              is_unbalance = TRUE,
-             num_leaves = tune()
+             num_leaves = tune(),
+             num_threads = future::availableCores()
              ) %>%
   set_mode(mode = "classification") 
 
 boost_tree_catboost_spec <- 
   boost_tree(
-    trees = 50L,
+    trees = 3000L,
      learn_rate =  tune()
   ) %>% 
   set_engine(engine = "catboost" ) %>%
@@ -515,10 +519,10 @@ logistic_reg_glmnet_spec <-
 dep_models <- 
    workflow_set(
       preproc = list(base = base_rec,
-#                     impute = impute_rec,
+                     impute = impute_rec,
                      dummy = dummy_rec),
       models = list(lgbm = boost_tree_lgbm_spec,
-#                    catboost = boost_tree_catboost_spec,
+                    catboost = boost_tree_catboost_spec,
                     glmnet = logistic_reg_glmnet_spec),
       cross = FALSE
    ) %>% 
@@ -534,28 +538,28 @@ lgbm_params <- dep_models |>
   update(
       min_n = min_n(range = c(3,70)),
       tree_depth = tree_depth(range = c(20,100)),
-      learn_rate = learn_rate(range = c(-2.4,-0.6)),
+      learn_rate = learn_rate(range = c(-2.9,-2.0)),
       num_leaves = num_leaves(range = c(10,400))       
          )
              
 
-#catboost_params <- dep_models |> 
-#  extract_workflow("impute_catboost") |> 
-#  parameters() |>
-#  update(
-#          learn_rate = learn_rate(range = c(-4.5,-3.0))
-#  ) 
+catboost_params <- dep_models |> 
+  extract_workflow("impute_catboost") |> 
+  parameters() |>
+  update(
+          learn_rate = learn_rate(range = c(-3.5,-2.0))
+  ) 
                    
 dep_models <- dep_models |> 
   option_add(
     param_info = lgbm_params,
     id = "base_lgbm"
   ) |> 
-#  option_add(
-#    param_info = catboost_params,
-#    id = "impute_catboost"
-#  ) |> 
-   workflow_map("tune_sim_anneal", resamples = folds, iter = 3, 
+  option_add(
+    param_info = catboost_params,
+    id = "impute_catboost"
+  ) |> 
+   workflow_map("tune_sim_anneal", resamples = folds, iter = 12, 
                 metrics = metric_set(mn_log_loss, accuracy), verbose = TRUE)
 
 rank_results(dep_models, rank_metric = "accuracy", select_best = TRUE)                    
@@ -590,21 +594,21 @@ best_params <- dep_models |>
   workflowsets::extract_workflow_set_result("base_lgbm") |> 
   select_best(metric = "accuracy")  
                    
-#dep_models %>%
-#  dplyr::filter(grepl("impute_catboost", wflow_id)) %>%
-#  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
-#  dplyr::select(wflow_id, metrics) %>%
-#  tidyr::unnest(cols = metrics) |> 
-#  arrange(desc(mean))
+dep_models %>%
+  dplyr::filter(grepl("impute_catboost", wflow_id)) %>%
+  dplyr::mutate(metrics = purrr::map(result, tune::collect_metrics)) %>%
+  dplyr::select(wflow_id, metrics) %>%
+  tidyr::unnest(cols = metrics) |> 
+  arrange(desc(mean))
 
-#dep_models |> 
-#  workflowsets::extract_workflow_set_result("impute_catboost") |> 
-#  autoplot() +
-#  labs(title = "Catboost Hyperparameter Search")
+dep_models |> 
+  workflowsets::extract_workflow_set_result("impute_catboost") |> 
+  autoplot() +
+  labs(title = "Catboost Hyperparameter Search")
 
-#best_params <- dep_models |> 
-#  workflowsets::extract_workflow_set_result("impute_catboost") |> 
-#  select_best(metric = "accuracy")  
+best_params <- dep_models |> 
+  workflowsets::extract_workflow_set_result("impute_catboost") |> 
+  select_best(metric = "accuracy")  
 
 
 ens <- stacks::stacks() %>%
@@ -683,7 +687,50 @@ ggplot_imp(explainer)
 ``` 
 
 
-## Submission
+# Model Calibration
+
+```{r}
+#| label: calibration
+#| warning: false
+#| message: false                   
+
+threshold_data <- predict(classification_fit, train_df, type = "prob") |> 
+   bind_cols(train_df) |> 
+   threshold_perf(personality, .pred_Extrovert, thresholds = seq(0.5, 1, by = 0.0025))
+
+threshold_data <- threshold_data |>
+  filter(.metric != "distance") |>
+  mutate(group = case_when(
+    .metric == "sens" | .metric == "spec" ~ "1",
+    TRUE ~ "2"
+  ))
+
+max_j_index_threshold <- threshold_data |>
+  filter(.metric == "j_index") |>
+  filter(.estimate == max(.estimate)) |>
+  pull(.threshold)
+
+ggplot(threshold_data, aes(x = .threshold, y = .estimate, color = .metric, alpha = group)) +
+  geom_line() +
+  theme_minimal() +
+  scale_color_viridis_d(end = 0.9) +
+  scale_alpha_manual(values = c(.4, 1), guide = "none") +
+  geom_vline(xintercept = max_j_index_threshold, alpha = .6, color = "grey30") +
+  labs(
+    x = "'Good' Threshold\n(above this value is considered 'good')",
+    y = "Metric Estimate",
+    title = "Balancing performance by varying the threshold",
+    subtitle = "Sensitivity or specificity alone might not be enough!\nVertical line = Max J-Index"
+  )
+
+max_j_index_threshold[1]
+
+```
+
+
+
+
+# Submission
 
 
 ```{r }                   
@@ -692,18 +739,27 @@ ggplot_imp(explainer)
 #| message: false
 
 
-augment(classification_fit, train_df) %>% 
+predict(classification_fit, train_df, type = "prob") %>% 
+  bind_cols(train_df) |> 
+  mutate(
+    .pred_class = make_two_class_pred(
+      estimate = .pred_Extrovert,
+      levels = levels(personality),
+      threshold = max_j_index_threshold[1]
+    )
+  ) |> 
   conf_mat(personality, .pred_class) %>%
   yardstick:::autoplot.conf_mat(type = "heatmap") +
   scale_fill_distiller(palette = "RdPu")
 
-submit_df <-  augment(
-  classification_fit,
-  competition_df %>%
-    left_join(train_df %>% select(-id), by = all_of(features)) %>%
-    rename(train_personality = personality)
-) %>%
-  transmute(id, personality = if_else(is.na(train_personality), .pred_class, train_personality))
+submit_df <- predict(classification_fit, competition_df, type = "prob") |> 
+  bind_cols(competition_df) |> 
+  transmute(
+    id,
+    Personality= if_else(.pred_Extrovert > max_j_index_threshold[1],
+                          "Extrovert",
+                          "Introvert")
+  )
 
 head(submit_df)  %>% 
      knitr::kable()      
