@@ -504,7 +504,7 @@ mlp_brulee_spec <-
       ) %>%
   set_engine('brulee',
              rate_schedule = "cyclic",
-             mixture = 0, ## weight decay default is 0.001
+             mixture = 1, ## weight decay default is 0.001
           #   optimizer = "Adadelta",
           #   batch_size = 2^5,
              validation = 0.02,
