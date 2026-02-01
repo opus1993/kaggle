@@ -1,0 +1,659 @@
+---
+title: "Heart Disease"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    number_sections: true
+    fig_caption: true
+    toc: true
+    fig_width: 7
+    fig_height: 4.5
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+![](https://www.coulditbehcm.com/assets/buildeasy/us-commercial/coulditbehcm/en/images/tabs/tabs-non-obstructive-hcm.gif)
+
+
+# Introduction  {.tabset .tabset-fade .tabset-pills}
+
+The goal of this competition is to predict heart disease.
+
+My notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
+
+Lets dive right in.
+
+The Kaggle kernels have many of the common r packages built in.  
+
+## Load libraries
+
+```{r }
+#| label: setup
+#| warning: false
+#| message: false
+
+if (dir.exists("/kaggle")){
+  path <- "/kaggle/input/playground-series-s6e2/"
+    
+# options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
+
+install.packages("pak")
+pak::pak("bonsai")
+pak::pak("ggplot2")
+    
+remotes::install_github("luisdva/hexsession", quiet = TRUE)    
+remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.2.8/catboost-R-linux-x86_64-1.2.8.tgz', 
+                     INSTALL_opts = c("--no-multiarch", "--no-test-load"),
+                    quiet = TRUE)  
+    
+cores <- future::availableCores()
+
+} else {
+  path <- stringr::str_c(here::here("data"),"/")
+  orig_path <- stringr::str_c(here::here("data"),"/")
+
+  cores <- future::availableCores(omit = 2)
+  
+}
+ 
+suppressPackageStartupMessages({
+library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
+library(tidymodels, quietly = TRUE) # metapackage see https://www.tidymodels.org/
+
+library(correlationfunnel)
+
+library(bonsai)  # Tidymodels access to lightgbm
+library(catboost) # Catboost
+library(stacks) # ensembling    
+library(DALEXtra) # Tidymodels Explainability         
+
+# library(mirai)
+# daemons(cores)
+    
+})
+
+conflicted::conflict_prefer("select", "dplyr")
+conflicted::conflict_prefer("where", "dplyr")
+
+
+tidymodels_prefer()
+
+options(tidymodels.dark = TRUE)
+
+theme_set(theme_minimal())
+
+hexsession::make_tile(packages = c("lightgbm","bonsai", "catboost", "DALEXtra", "DALEX",  "correlationfunnel","yardstick","workflows",
+                                   "tune","rsample","recipes","parsnip","dials","broom","tidymodels","lubridate",
+                                   "forcats","stringr","dplyr","purrr","readr","tidyr","tibble","ggplot2","tidyverse"),
+                   #  highlight_mode = TRUE
+                     )
+
+
+```
+
+
+
+## Load Data
+
+```{r }
+#| label: load data
+#| warning: false
+#| message: false
+preprocessor <- function(dataframe) {
+
+dataframe <- dataframe |>
+    janitor::clean_names() |> 
+    
+    mutate(sex = factor(sex),
+           chest_pain_type = factor(chest_pain_type),
+           ekg_results = factor(ekg_results),
+           exercise_angina = factor(exercise_angina),
+           fbs_over_120 = factor(fbs_over_120),
+           thallium = factor(thallium),
+           st_depression = factor(st_depression)) |> 
+  
+    mutate(across(c(where(is.character)), \(x) as.factor(x)))  
+
+return(dataframe)
+}
+
+raw_df <- read_csv(str_c(path, "train.csv"),
+                   show_col_types = FALSE) 
+
+tst_df <- read_csv(str_c(path, "test.csv"),
+                   show_col_types = FALSE)  
+
+all_df <-
+    bind_rows(raw_df %>% mutate(source = "train"),
+              tst_df %>% mutate(source = "test")) |>
+          preprocessor() 
+
+train_df <- all_df %>% 
+  dplyr::filter(source == "train") %>% 
+  dplyr::select(-source) 
+
+competition_df <- all_df %>% 
+  dplyr::filter(source == "test") %>% 
+  dplyr::select(-source, -heart_disease)
+
+
+```
+
+
+
+
+## Features
+
+We will de-duplicate the training set and use the first heart_disease data point.
+
+```{r}
+#| label: Features
+#| warning: false
+#| message: false
+
+
+
+features <- train_df %>%
+  dplyr::select(-id, -heart_disease) |> 
+  names()
+
+train_df <- train_df %>% 
+  dplyr::group_by(pick({{features}})) |> 
+  dplyr::summarise(id = min(id),
+                   heart_disease = first(heart_disease),
+                   .groups = "drop")
+
+nom_features <- train_df |> 
+  dplyr::select(dplyr::all_of(features)) |> 
+  dplyr::select(dplyr::where(is.factor)) |> 
+  names() 
+
+logical_features <- train_df |> 
+  dplyr::select(dplyr::all_of(features)) |> 
+  dplyr::select(dplyr::where(is.logical)) |> 
+  names() 
+
+num_features <- train_df |> 
+  dplyr::select(dplyr::all_of(features)) |> 
+  dplyr::select(dplyr::where(is.numeric)) |> 
+  names()
+```
+
+Nominal features:
+
+`r nom_features`
+
+Numeric features: 
+
+`r num_features`
+
+Logical features: 
+
+`r logical_features`
+
+
+Size of the combined train and competition datasets:
+
+`r nrow(all_df)`
+
+Size of training set after de-duplication
+
+`r nrow(train_df)`
+
+
+
+# EDA {.tabset .tabset-fade .tabset-pills}
+
+## Numeric features
+
+
+```{r}
+#| label: numeric
+#| warning: false
+#| message: false
+#| fig.height: 6
+
+train_df %>% 
+  dplyr::select(all_of(num_features), heart_disease ) %>% 
+  pivot_longer(-heart_disease,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  ggplot(aes(value, fill = heart_disease)) +
+  geom_density(position = "stack") +
+  scale_fill_brewer(type = "seq", palette = "YlOrRd") +
+  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        
+    strip.text = element_text(face = "bold", hjust = 0, size = rel(0.5), margin = margin_part(b = 5, l = -10)),
+    strip.clip = "off",
+    panel.spacing = unit(2, "lines"),
+    
+        legend.position = "top") +
+  labs(color = NULL, fill = "heart_disease",
+       title = "Numeric Feature Univariate Distributions",
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+
+```
+
+
+## Nominal and Logical features
+
+Explore the distribution of outcome class by factor level.
+
+
+```{r}
+#| label: nominal
+#| warning: false
+#| message: false
+#| fig-height: 12
+
+if(length(nom_features) >0){
+
+train_df %>% 
+  select(all_of(nom_features), all_of(logical_features), heart_disease) %>% 
+  mutate(across(nom_features, fct_lump_n, n = 5, other_level = 'other', ties.method = "first"),
+         across(logical_features, \(x) factor(x))) %>%
+  pivot_longer(-heart_disease,
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+    
+  filter(!is.na(heart_disease)) %>% 
+    
+  summarise(n = n(),
+            .by = c(heart_disease, metric, value)) %>%
+      
+  mutate(value = tidytext::reorder_within(value, n, metric)) %>%
+    
+  ggplot(aes(x = n, y = value, fill = heart_disease)) +
+  geom_col() +
+  tidytext::scale_y_reordered() +
+  scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
+  scale_fill_brewer(type = "seq", palette = "YlOrRd") +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+  #  strip.text = element_text(margin = margin_part(b = -20, l = 8)),
+  #  strip.clip = "off",
+  #  panel.spacing = unit(2, "lines"),
+       legend.position = "bottom") +
+  labs(title = "Nominal Feature Counts",
+       fill = NULL, y = NULL,
+       caption = "Data: Kaggle | Visual: Jim Gruman")
+
+}
+
+```
+
+## Counts of Missingness
+
+                  
+```{r}
+#| label: counts of missingness
+
+train_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+
+competition_df %>% 
+  summarize(across(all_of(features), function(x) sum(is.na(x)))) %>% 
+  pivot_longer(everything(),
+              names_to = "feature",
+              values_to = "Count of Missing") %>% 
+                   knitr::kable()
+
+```
+
+## Counts of Distinct
+                   
+               
+```{r}
+#| label: counts of distinct
+               
+train_df %>%
+  summarize(across(all_of(features), n_distinct)) %>%
+  pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct train") |>
+  left_join(
+    competition_df %>%
+      summarize(across(all_of(features), n_distinct)) %>%
+      pivot_longer(everything(), names_to = "feature", values_to = "Count of distinct test"),
+    by = join_by(feature)
+  ) %>% 
+                   knitr::kable()
+               
+```
+
+## Duplicated
+
+Is this competition transaction already in the training data with a correct label?
+
+
+```{r}
+#| label: duplicates
+#| warning: false
+#| message: false
+
+bind_rows(train_df %>% mutate(source = "train"),
+              competition_df %>% mutate(source = "test")) |> 
+    group_by_at(features) %>%
+    mutate(num_dups = n(),
+           dup_id = row_number()) %>% 
+    ungroup() %>% 
+    group_by(source) %>%
+    mutate(is_duplicated = dup_id > 1) %>% 
+    count(is_duplicated) %>% 
+                   knitr::kable()
+
+
+
+```
+
+
+## Pairwise Correlations
+                   
+`ggcorrplot` provides a quick look at numeric features where the correlation may be significant. 
+
+```{r}
+#| label: pairwise correlations
+#| fig-width: 9
+
+trainp.mat <- train_df %>% 
+  mutate(heart_disease = as.numeric(heart_disease)) |> 
+  select(all_of(num_features), heart_disease) %>% 
+  ggcorrplot::cor_pmat() 
+                   
+train_df %>% 
+  mutate(heart_disease = as.numeric(heart_disease)) |> 
+  select(all_of(num_features), heart_disease) %>%                    
+  cor() %>% 
+  ggcorrplot::ggcorrplot(hc.order = TRUE, 
+                         lab = TRUE,
+                         p.mat = trainp.mat,
+    type = "lower", insig = "blank") +
+  labs(title = "Pairwise Correlations Training Set")
+                   
+competitionp.mat <- competition_df %>% 
+  select(all_of(num_features)) %>% 
+  ggcorrplot::cor_pmat() 
+                   
+competition_df %>% 
+  select(all_of(num_features)) %>%                   
+  cor()   %>% 
+  ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,
+                         p.mat = competitionp.mat,
+    type = "lower", insig = "blank") +
+   labs(title = "Pairwise Correlations Competition Set")
+
+```                    
+
+## Correlation Funnel
+
+
+```{r}
+#| label: correlation funnel 
+#| warning: false
+#| message: false
+
+
+y_df <- train_df |>
+  transmute(heart_disease = as.numeric(heart_disease)) 
+
+train_df %>%
+  select(all_of(num_features)) %>%
+  correlationfunnel::binarize(one_hot = TRUE, n_bins = 3) %>%
+  bind_cols(y_df) |>
+  correlate(target = heart_disease) %>%
+  plot_correlation_funnel()
+
+``` 
+                   
+                   
+## Target
+
+Training scores range from 19.5 to 100, with many of them at either extreme.
+
+```{r}
+#| label: outcome 
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+train_df %>%
+  summarize(outcome_sum = n(), .by = heart_disease) %>%
+  arrange(desc(outcome_sum)) %>%
+  mutate(prop = outcome_sum / nrow(train_df)) %>%
+  mutate(ypos = cumsum(prop) - 0.5 * prop) %>%
+  ggplot(aes(x = "", y = prop, fill = heart_disease)) +
+  geom_bar(stat = "identity",
+           width = 1,
+           show.legend = FALSE) +
+  geom_text(
+    aes(
+      y = ypos,
+      label= paste0(heart_disease
+                     , "\n", round(prop, 2) * 100, "%")
+    ),
+    color = "white",
+    nudge_x = 0,
+    size = 3
+  ) +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +                   
+  coord_polar("y", start = 0) +
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank()  ) +
+  labs(title = "Heart Disease", caption = "Data: Kaggle.com | Visual: Jim Gruman")
+
+``` 
+                
+# Machine Learning {.tabset .tabset-fade .tabset-pills}
+
+
+## Recipe
+
+```{r}
+#| label: recipe
+#| warning: false
+#| message: false
+#| fig.width: 6
+
+if (file.exists("/kaggle/working/classification_fit.rds")){             
+train_df <- train_df |> predict(classification_fit, train_df) |>  
+      transmute(past_run = .pred_Absence)  |> 
+    bind_cols(train_df) 
+
+rec <- recipe(formula(paste0("heart_disease ~ ", str_c(features, "past_run", collapse = " + "))), data = train_df)      
+} else {
+rec <- recipe(formula(paste0("heart_disease ~ ", str_c(features, collapse = " + "))), data = train_df)      
+    
+}
+    
+folds <- vfold_cv(train_df,
+                  v = 3,
+                  repeats = 1,
+                  strata = heart_disease)
+```
+
+
+## Machine Learning 
+
+
+```{r}
+#| label: ml 
+#| warning: false
+#| message: false
+
+
+boost_tree_catboost_spec <- 
+  boost_tree(
+    trees = 100,
+    tree_depth = tune(),
+    learn_rate =  tune()
+  ) %>% 
+  set_engine(engine = "catboost" ,
+         #     early_stopping_rounds = 350,
+             od_type="Iter",
+              use_best_model = TRUE,
+             thread_count = cores) %>%  
+  set_mode(mode = "classification")         
+                   
+dep_models <-
+   workflow_set(
+      preproc = list(base = rec),
+      models = list(catboost = boost_tree_catboost_spec),
+      cross = FALSE
+   ) %>%
+  option_add_parameters() |>
+  option_add(
+    control = finetune::control_sim_anneal( save_pred = TRUE, save_workflow = TRUE, verbose = TRUE, verbose_iter = TRUE),
+    metrics = metric_set(roc_auc)
+  )
+
+catboost_params <- dep_models |>
+ extract_workflow("base_catboost") |>
+ extract_parameter_set_dials() |>
+ update(
+         tree_depth = tree_depth(range = c(6, 12)),
+         learn_rate = learn_rate(range = c(-2.5,-1.0))
+ ) 
+
+all_models <- dep_models |>
+  workflow_map("tune_sim_anneal", 
+               resamples = folds, 
+               iter = 5,
+               metrics = metric_set(roc_auc), verbose = TRUE)             
+
+autoplot(all_models) +
+  geom_text(aes(y = mean -0.002, label = wflow_id), angle = 90, hjust = 1)+
+  scale_y_continuous(limits = c(0,NA), expand = c(0, 0)) |>
+  theme(legend.position = "none")
+
+rank_results(all_models, rank_metric = "roc_auc", select_best = TRUE) %>%
+   select(rank, mean, model, wflow_id, .config) |> 
+   arrange(desc(mean))
+
+dep_stack <- stacks() %>%
+  add_candidates(all_models) %>%
+  blend_predictions(  metric =  metric_set(roc_auc),
+      penalty = c(10^seq(-4.7, -3.3, 0.1)),
+      non_negative = TRUE,
+      control = tune::control_grid(allow_par = TRUE))
+
+autoplot(dep_stack)
+
+autoplot(dep_stack, type = "members")        
+                   
+autoplot(dep_stack, "weights")
+                   
+classification_fit <- dep_stack %>% 
+     fit_members()    
+
+```
+
+
+
+# Performance {.tabset .tabset-fade .tabset-pills}
+
+```{r}
+#| label: explainer
+#| warning: false
+#| message: false
+#| fig.height: 12
+                   
+                   
+explainer <- 
+  explain_tidymodels(
+    classification_fit, 
+    data = train_df %>% dplyr::select(all_of(features)), 
+    y = as.numeric(train_df$heart_disease),
+    label = "Ensemble",
+    verbose = FALSE
+  )  %>% 
+  model_parts()
+
+ggplot_imp <- function(...) {
+  obj <- list(...)
+  metric_name <- attr(obj[[1]], "loss_name")
+  metric_lab <- paste(metric_name, 
+                      "after permutations\n(higher indicates more important)")
+  
+  full_vip <- bind_rows(obj) %>%
+    filter(variable != "_baseline_")
+  
+  perm_vals <- full_vip %>% 
+    filter(variable == "_full_model_") %>% 
+    group_by(label) %>% 
+    summarise(dropout_loss = mean(dropout_loss))
+  
+  p <- full_vip %>%
+    filter(variable != "_full_model_") %>% 
+    mutate(variable = fct_reorder(variable, -dropout_loss)) %>%
+    ggplot(aes(dropout_loss, variable)) 
+  
+  if(length(obj) > 1) {
+    p <- p + 
+      facet_wrap(vars(label)) +
+      geom_vline(data = perm_vals, aes(xintercept = dropout_loss, color = label),
+                 linewidth = 1.4, lty = 2, alpha = 0.7) +
+      geom_boxplot(aes(color = label, fill = label), alpha = 0.2)
+  } else {
+    p <- p + 
+      geom_vline(data = perm_vals, aes(xintercept = dropout_loss),
+                 linewidth = 1.4, lty = 2, alpha = 0.7) +
+      geom_boxplot(fill = "#91CBD765", alpha = 0.4)
+    
+  }
+  p +
+    theme(legend.position = "none") +
+    labs(x = metric_lab, 
+         y = NULL,  fill = NULL,  color = NULL)
+}
+                   
+ggplot_imp(explainer)      
+                       
+
+```                      
+
+
+                   
+# Submission
+                   
+
+```{r}
+#| label: submission
+#| warning: false
+#| message: false
+#| fig.height: 6
+#| fig.width: 6   
+
+write_rds(classification_fit, "/kaggle/working/classification_fit.rds")
+                                   
+predict(classification_fit, train_df, type = "prob") %>% 
+  bind_cols(train_df) |> 
+  mutate(
+    .pred_class = factor(if_else(.pred_Absence > 0.5, "Absence","Presence"))
+  ) |>                    
+  conf_mat(heart_disease, .pred_class) %>%
+  yardstick:::autoplot.conf_mat(type = "heatmap") +
+  scale_fill_distiller(palette = "RdPu")
+                   
+submit_df <- predict(classification_fit, competition_df, type = "prob") |>
+  bind_cols(competition_df) |>
+
+  transmute(
+   id,
+  `Heart Disease` = .pred_Absence)
+
+head(submit_df)  %>% 
+     knitr::kable()      
+
+submit_df  %>% 
+  write_csv("submission.csv")
+```   
