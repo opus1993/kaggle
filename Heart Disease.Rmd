@@ -466,7 +466,7 @@ train_df %>%
 
 if (file.exists("/kaggle/working/classification_fit.rds")){             
 train_df <- train_df |> predict(classification_fit, train_df) |>  
-      transmute(past_run = .pred_Absence)  |> 
+      transmute(past_run = .pred_Presence)  |> 
     bind_cols(train_df) 
 
 rec <- recipe(formula(paste0("heart_disease ~ ", str_c(features, "past_run", collapse = " + "))), data = train_df)      
@@ -486,7 +486,7 @@ folds <- vfold_cv(train_df,
 
 
 ```{r}
-#| label: ml 
+#| label: ml setup
 #| warning: false
 #| message: false
 
@@ -524,12 +524,29 @@ catboost_params <- dep_models |>
          learn_rate = learn_rate(range = c(-2.5,-1.0))
  ) 
 
+catboost_params
+                   
+```
+
+```{r}                   
+#| label: ml workflow execution
+                   
 all_models <- dep_models |>
+ option_add(
+   param_info = catboost_params,
+   id = "base_catboost"
+ ) |>
   workflow_map("tune_sim_anneal", 
                resamples = folds, 
                iter = 5,
-               metrics = metric_set(roc_auc), verbose = TRUE)             
+               metrics = metric_set(roc_auc), verbose = TRUE)     
 
+                   
+```                   
+
+```{r}   
+#| label: ml workflow results
+                   
 autoplot(all_models) +
   geom_text(aes(y = mean -0.002, label = wflow_id), angle = 90, hjust = 1)+
   scale_y_continuous(limits = c(0,NA), expand = c(0, 0)) |>
@@ -538,7 +555,10 @@ autoplot(all_models) +
 rank_results(all_models, rank_metric = "roc_auc", select_best = TRUE) %>%
    select(rank, mean, model, wflow_id, .config) |> 
    arrange(desc(mean))
-
+```
+```{r}   
+#| label: ml ensemble
+                   
 dep_stack <- stacks() %>%
   add_candidates(all_models) %>%
   blend_predictions(  metric =  metric_set(roc_auc),
@@ -638,18 +658,22 @@ write_rds(classification_fit, "/kaggle/working/classification_fit.rds")
 predict(classification_fit, train_df, type = "prob") %>% 
   bind_cols(train_df) |> 
   mutate(
-    .pred_class = factor(if_else(.pred_Absence > 0.5, "Absence","Presence"))
+    .pred_class = factor(if_else(.pred_Absence < 0.5, "Absence","Presence"))
   ) |>                    
   conf_mat(heart_disease, .pred_class) %>%
   yardstick:::autoplot.conf_mat(type = "heatmap") +
   scale_fill_distiller(palette = "RdPu")
+
+predict(classification_fit, train_df, type = "prob") %>% 
+  bind_cols(train_df) |> 
+  yardstick::roc_auc(heart_disease, .pred_Absence)
                    
 submit_df <- predict(classification_fit, competition_df, type = "prob") |>
   bind_cols(competition_df) |>
 
   transmute(
    id,
-  `Heart Disease` = .pred_Absence)
+  `Heart Disease` = .pred_Presence)
 
 head(submit_df)  %>% 
      knitr::kable()      
