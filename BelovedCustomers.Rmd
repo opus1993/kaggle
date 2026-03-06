@@ -42,6 +42,9 @@ pak::pak("bonsai")
 pak::pak("ggplot2")
 pak::pak("embed")
 pak::pak("rsample")
+
+
+remotes::install_github("MatthewBJane/ThemePark", quiet = TRUE)    
     
 remotes::install_github("luisdva/hexsession", quiet = TRUE)    
 remotes::install_url('https://github.com/catboost/catboost/releases/download/v1.2.8/catboost-R-linux-x86_64-1.2.8.tgz', 
@@ -64,6 +67,8 @@ library(tidymodels, quietly = TRUE) # metapackage see https://www.tidymodels.org
 
 library(correlationfunnel)
 
+library(ThemePark)
+    
 library(embed)
 library(bonsai)
     
@@ -84,13 +89,13 @@ tidymodels_prefer()
 
 options(tidymodels.dark = TRUE)
 
-theme_set(theme_minimal())
+theme_set(theme_spiderman())
 
-hexsession::make_tile(packages = c("bonsai", "catboost", "DALEXtra", "DALEX",  "correlationfunnel","yardstick","workflows",
-                                   "tune","rsample","recipes","parsnip","dials","broom","tidymodels","lubridate",
-                                   "forcats","stringr","dplyr","purrr","readr","tidyr","tibble","ggplot2","tidyverse"),
+#hexsession::make_tile(packages = c("bonsai", "catboost", "DALEXtra", "DALEX",  "correlationfunnel","yardstick","workflows",
+#                                   "tune","rsample","recipes","parsnip","dials","broom","tidymodels","lubridate","ThemePark",
+#                                   "forcats","stringr","dplyr","purrr","readr","tidyr","tibble","ggplot2","tidyverse"),
                    #  highlight_mode = TRUE
-                     )
+#                     )
 
 
 ```
@@ -227,7 +232,7 @@ train_df %>%
   ) %>%
   ggplot(aes(value, fill = churn)) +
   geom_density(position = "stack") +
-  scale_fill_brewer(type = "qual", palette = "Dark2") +        
+ # scale_fill_brewer(type = "qual", palette = "Dark2") +        
   facet_wrap(vars(metric), scales = "free", ncol = 3) +
   theme(panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
@@ -278,7 +283,7 @@ train_df %>%
   geom_col() +
   tidytext::scale_y_reordered() +
   scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
-  scale_fill_brewer(type = "qual", palette = "Dark2") +        
+#  scale_fill_brewer(type = "qual", palette = "Dark2") +        
   facet_wrap(vars(metric), scales = "free", ncol = 2) +
   theme(panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
@@ -447,7 +452,7 @@ train_df %>%
     nudge_x = 0,
     size = 3
   ) +
-  scale_fill_brewer(type = "qual", palette = "Dark2") +                   
+#  scale_fill_brewer(type = "qual", palette = "Dark2") +                   
   coord_polar("y", start = 0) +
   theme(
     axis.text = element_blank(),
@@ -500,7 +505,7 @@ folds |>
   tidy() |>
   ggplot(aes(x = Fold, y = factor(Row), fill = Data)) +
   geom_tile() +
-  scale_fill_brewer(type = "qual", palette = "Dark2") +        
+#  scale_fill_brewer(type = "qual", palette = "Dark2") +        
   labs(y = "Customer Number") +
   theme(
     axis.text.y = element_blank(),
