@@ -22,6 +22,8 @@ The goal of this competition is to predict customer churn.
 
 My notebook serves as a demonstration of some of the possible techniques available to arrive at a solution.  I intend to add to this as I have time available. Your questions and comments are welcome.
 
+Check out the spiderman ggplot2 theming from Velu P.K. Immonen.
+
 Lets dive right in.
 
 The Kaggle kernels have many of the common r packages built in.  
@@ -37,12 +39,11 @@ if (dir.exists("/kaggle")){
   path <- "/kaggle/input/competitions/playground-series-s6e3/"
 # options(repos = c(CRAN = "https://packagemanager.posit.co/cran/2021-03-22"))
 
-install.packages("pak")
+install.packages("pak", quiet = TRUE)
+pak::pak("stacks")
 pak::pak("bonsai")
-pak::pak("ggplot2")
 pak::pak("embed")
-pak::pak("rsample")
-
+pak::pak("DALEXtra")
 
 remotes::install_github("MatthewBJane/ThemePark", quiet = TRUE)    
     
@@ -60,7 +61,11 @@ cores <- future::availableCores()
   cores <- future::availableCores(omit = 2)
   
 }
- 
+```
+
+```{r}
+#| label: load libraries
+
 suppressPackageStartupMessages({
 library(tidyverse, quietly = TRUE) # metapackage of all tidyverse packages
 library(tidymodels, quietly = TRUE) # metapackage see https://www.tidymodels.org/
@@ -91,11 +96,11 @@ options(tidymodels.dark = TRUE)
 
 theme_set(theme_spiderman())
 
-#hexsession::make_tile(packages = c("bonsai", "catboost", "DALEXtra", "DALEX",  "correlationfunnel","yardstick","workflows",
-#                                   "tune","rsample","recipes","parsnip","dials","broom","tidymodels","lubridate","ThemePark",
-#                                   "forcats","stringr","dplyr","purrr","readr","tidyr","tibble","ggplot2","tidyverse"),
+hexsession::make_tile(packages = c("bonsai", "catboost", "DALEXtra", "DALEX",  "correlationfunnel","yardstick","workflows",
+                                   "tune","rsample","recipes","parsnip","dials","broom","tidymodels","lubridate",
+                                   "forcats","stringr","dplyr","purrr","readr","tidyr","tibble","ggplot2","tidyverse"),
                    #  highlight_mode = TRUE
-#                     )
+                     )
 
 
 ```
@@ -149,8 +154,6 @@ competition_df <- all_df %>%
 
 
 ```
-
-
 
 
 ## Features
@@ -232,19 +235,17 @@ train_df %>%
   ) %>%
   ggplot(aes(value, fill = churn)) +
   geom_density(position = "stack") +
- # scale_fill_brewer(type = "qual", palette = "Dark2") +        
-  facet_wrap(vars(metric), scales = "free", ncol = 3) +
+  scale_fill_discrete(
+    palette = spiderman_theme_colors[c("dark","light")]
+  ) +
+  facet_wrap(vars(metric), scales = "free", ncol = 2) +
   theme(panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
-        
-    strip.text = element_text(face = "bold", hjust = 0, size = rel(0.5), margin = margin_part(b = 5, l = -10)),
-    strip.clip = "off",
-    panel.spacing = unit(2, "lines"),
-    
         legend.position = "top") +
   labs(color = NULL, fill = "churn",
        title = "Numeric Feature Univariate Distributions",
        caption = "Data: Kaggle | Visual: Jim Gruman")
+
 
 
 ```
@@ -259,7 +260,7 @@ Explore the distribution of outcome class by factor level.
 #| label: nominal
 #| warning: false
 #| message: false
-#| fig-height: 18
+#| fig-height: 36
 
 if(length(nom_features) >0){
 
@@ -283,13 +284,12 @@ train_df %>%
   geom_col() +
   tidytext::scale_y_reordered() +
   scale_x_continuous(n.breaks = 3, guide = guide_axis(n.dodge = 2))  +
-#  scale_fill_brewer(type = "qual", palette = "Dark2") +        
+  scale_fill_discrete(
+    palette = spiderman_theme_colors[c("dark","light")]
+  ) +      
   facet_wrap(vars(metric), scales = "free", ncol = 2) +
   theme(panel.grid.major = element_blank(),
         panel.grid.minor = element_blank(),
-  #  strip.text = element_text(margin = margin_part(b = -20, l = 8)),
-  #  strip.clip = "off",
-  #  panel.spacing = unit(2, "lines"),
        legend.position = "bottom") +
   labs(title = "Nominal Feature Counts",
        fill = NULL, y = NULL,
@@ -387,7 +387,8 @@ train_df %>%
                          lab = TRUE,
                          p.mat = trainp.mat,
     type = "lower", insig = "blank") +
-  labs(title = "Pairwise Correlations Training Set")
+  labs(title = "Pairwise Correlations Training Set") +
+   theme_spiderman()
                    
 competitionp.mat <- competition_df %>% 
   select(all_of(num_features)) %>% 
@@ -399,7 +400,8 @@ competition_df %>%
   ggcorrplot::ggcorrplot(hc.order = TRUE, lab = TRUE,
                          p.mat = competitionp.mat,
     type = "lower", insig = "blank") +
-   labs(title = "Pairwise Correlations Competition Set")
+   labs(title = "Pairwise Correlations Competition Set") +
+   theme_spiderman()
 
 ```                    
 
@@ -410,7 +412,7 @@ competition_df %>%
 #| label: correlation funnel 
 #| warning: false
 #| message: false
-
+#| fig-width: 9
 
 y_df <- train_df |>
   transmute(churn = as.numeric(churn)) 
@@ -420,8 +422,8 @@ train_df %>%
   correlationfunnel::binarize(one_hot = TRUE, n_bins = 3) %>%
   bind_cols(y_df) |>
   correlate(target = churn) %>%
-  plot_correlation_funnel()
-
+  plot_correlation_funnel() +
+   theme_spiderman()
 ``` 
                    
                    
@@ -431,7 +433,7 @@ train_df %>%
 #| label: outcome 
 #| warning: false
 #| message: false
-#| fig.width: 6
+#| fig.width: 12
 
 train_df %>%
   summarize(outcome_sum = n(), .by = churn) %>%
@@ -450,15 +452,24 @@ train_df %>%
     ),
     color = "white",
     nudge_x = 0,
-    size = 3
+    family = "spiderman",
+    size = 12
   ) +
-#  scale_fill_brewer(type = "qual", palette = "Dark2") +                   
+  scale_fill_discrete(
+    palette = spiderman_theme_colors[c("dark","light")]
+  ) +              
   coord_polar("y", start = 0) +
-  theme(
-    axis.text = element_blank(),
-    axis.title = element_blank()  ) +
-  theme_void() +
-  labs(title = "Customer Churn", caption = "Data: Kaggle.com | Visual: Jim Gruman")
+  theme_spiderman() +
+  theme(axis.text = element_blank(),
+        axis.title = element_blank(),
+        panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.ticks = element_blank(),
+        axis.line = element_blank(),
+        panel.grid = element_blank()) +
+  labs(title = "Customer Churn", 
+       caption = "Data: Kaggle.com | Visual: Jim Gruman")
 
 ``` 
                 
@@ -472,8 +483,6 @@ train_df %>%
 #| warning: false
 #| message: false
 #| fig.width: 12
-
-list.files("/kaggle/working/")
                    
 if (file.exists("/kaggle/working/classification_fit.rds")){     
    
@@ -504,13 +513,13 @@ folds <- vfold_cv(train_df,
 folds |>
   tidy() |>
   ggplot(aes(x = Fold, y = factor(Row), fill = Data)) +
-  geom_tile() +
-#  scale_fill_brewer(type = "qual", palette = "Dark2") +        
+  geom_tile() +   
   labs(y = "Customer Number") +
   theme(
     axis.text.y = element_blank(),
     axis.ticks.y = element_blank()
-  )                   
+  ) +
+  theme_spiderman()                   
                    
 ```
 
@@ -526,7 +535,7 @@ folds |>
 
 boost_tree_catboost_spec <- 
   boost_tree(
-    trees = 27,
+    trees = 25,
     tree_depth = tune(),
     learn_rate =  tune()
   ) %>% 
@@ -663,10 +672,11 @@ ggplot_imp <- function(...) {
   p +
     theme(legend.position = "none") +
     labs(x = metric_lab, 
+         title = "DALEX Importance",
          y = NULL,  fill = NULL,  color = NULL)
 }
                    
-ggplot_imp(explainer)      
+ggplot_imp(explainer)     
                        
 
 ```                      
@@ -692,7 +702,7 @@ predict(classification_fit, train_df, type = "prob") %>%
   ) |>                    
   conf_mat(churn, .pred_class) %>%
   yardstick:::autoplot.conf_mat(type = "heatmap") +
-  scale_fill_distiller(palette = "RdPu")
+  theme_spiderman() 
 
 predict(classification_fit, train_df, type = "prob") %>% 
   bind_cols(train_df) |> 
